@@ -5,9 +5,14 @@
 #
 # source-controller stores every artifact it fetches and serves it over HTTP at the
 # URL in each source's .status.artifact.url. This script lists HelmCharts and
-# OCIRepositories (optionally GitRepositories and Buckets too), downloads each
+# OCIRepositories (optionally Buckets too), downloads each
 # artifact through a kubectl port-forward, verifies it against
 # .status.artifact.digest, and writes a manifest of what it saved.
+#
+# With --reconcile, sources that are not Ready are asked to reconcile first (the
+# same annotation `flux reconcile source` sets). For HelmCharts, the HelmRepository
+# or GitRepository they come from is reconciled before the chart. The script waits
+# up to --timeout seconds for Flux to handle each request, then downloads.
 #
 # Output layout:
 #   <out>/helmcharts/<namespace>/<name>/<chart>-<version>.tgz
@@ -26,11 +31,14 @@ Usage: download_flux_artifacts.sh [options]
       --context NAME      kubectl context to use
       --kubeconfig PATH   kubeconfig to use
   -n, --namespace NS      only sources in this namespace (default: all namespaces)
-      --kinds LIST        comma-separated: helmchart,oci,git,bucket (default: helmchart,oci)
+      --kinds LIST        comma-separated: helmchart,oci,bucket (default: helmchart,oci)
       --flux-namespace NS namespace where source-controller runs (default: flux-system)
       --port PORT         local port for the port-forward (default: 9797)
       --base-url URL      reach source-controller directly instead of port-forwarding,
                           e.g. http://source-controller.flux-system.svc when run in-cluster
+      --reconcile         ask Flux to reconcile sources that are not Ready, and wait
+                          for them before downloading (needs patch on the sources)
+      --timeout SECONDS   how long to wait for each reconcile round (default: 180)
   -h, --help              show this help
 EOF
 }
@@ -41,6 +49,8 @@ KINDS="helmchart,oci"
 FLUX_NS="flux-system"
 PORT="9797"
 BASE_URL=""
+RECONCILE=false
+TIMEOUT=180
 KUBECTL=(kubectl)
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +63,8 @@ while [[ $# -gt 0 ]]; do
     --flux-namespace) FLUX_NS="$2"; shift 2 ;;
     --port)           PORT="$2"; shift 2 ;;
     --base-url)       BASE_URL="${2%/}"; shift 2 ;;
+    --reconcile)      RECONCILE=true; shift ;;
+    --timeout)        TIMEOUT="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -76,6 +88,80 @@ cleanup() {
   rm -rf "$TMP"
 }
 trap cleanup EXIT
+
+READY='(.status.conditions // [] | map(select(.type == "Ready"))[0] // {})'
+
+resource_of() {  # Flux source kind -> kubectl resource name
+  case "$1" in
+    HelmChart)      echo helmcharts.source.toolkit.fluxcd.io ;;
+    HelmRepository) echo helmrepositories.source.toolkit.fluxcd.io ;;
+    GitRepository)  echo gitrepositories.source.toolkit.fluxcd.io ;;
+    OCIRepository)  echo ocirepositories.source.toolkit.fluxcd.io ;;
+    Bucket)         echo buckets.source.toolkit.fluxcd.io ;;
+    *) return 1 ;;
+  esac
+}
+
+# reconcile_and_wait RESOURCE NAMESPACE/NAME...
+# Requests a reconcile of each object and waits until Flux has handled every request
+# (status.lastHandledReconcileAt equals the requested token) or TIMEOUT expires.
+reconcile_and_wait() {
+  local resource="$1"; shift
+  local token obj handled deadline
+  local pending=() still=()
+  token="$(date -u +%Y-%m-%dT%H:%M:%SZ)-$$-$RANDOM"
+  for obj in "$@"; do
+    if "${KUBECTL[@]}" -n "${obj%%/*}" annotate --overwrite "$resource" "${obj#*/}" \
+        "reconcile.fluxcd.io/requestedAt=$token" >/dev/null 2>"$TMP/err"; then
+      echo "sync  ${resource%%.*} $obj: reconcile requested"
+      pending+=("$obj")
+    else
+      echo "warn  ${resource%%.*} $obj: cannot request reconcile: $(tail -1 "$TMP/err")" >&2
+    fi
+  done
+  deadline=$(( $(date +%s) + TIMEOUT ))
+  while [[ ${#pending[@]} -gt 0 && $(date +%s) -lt $deadline ]]; do
+    sleep 1
+    still=()
+    for obj in "${pending[@]}"; do
+      handled="$("${KUBECTL[@]}" -n "${obj%%/*}" get "$resource" "${obj#*/}" \
+        -o jsonpath='{.status.lastHandledReconcileAt}' 2>/dev/null || true)"
+      [[ "$handled" == "$token" ]] || still+=("$obj")
+    done
+    pending=(${still[@]+"${still[@]}"})
+  done
+  for obj in ${pending[@]+"${pending[@]}"}; do
+    echo "warn  ${resource%%.*} $obj: reconcile not handled within ${TIMEOUT}s" >&2
+  done
+}
+
+# reconcile_not_ready KIND RESOURCE LIST_JSON: reconcile every source in the list
+# that is not Ready (HelmCharts: their upstream source first).
+reconcile_not_ready() {
+  local kind="$1" resource="$2" list="$3" obj up_kind up_resource
+  local objs=() ups=()
+  local not_ready=".items[] | select((.spec.suspend // false) == false and $READY.status != \"True\")"
+  jq -r ".items[] | select(.spec.suspend == true and $READY.status != \"True\")
+      | \"warn  $kind \\(.metadata.namespace)/\\(.metadata.name): suspended, not reconciling\"" "$list" >&2
+  while read -r obj; do objs+=("$obj"); done < <(jq -r "$not_ready
+      | \"\\(.metadata.namespace)/\\(.metadata.name)\"" "$list")
+  [[ ${#objs[@]} -eq 0 ]] && return 0
+
+  if [[ "$kind" == helmchart ]]; then
+    # Reconcile the repositories the charts come from first, one batch per kind.
+    for up_kind in HelmRepository GitRepository Bucket OCIRepository; do
+      ups=()
+      while read -r obj; do ups+=("$obj"); done < <(jq -r --arg k "$up_kind" "$not_ready
+          | select(.spec.sourceRef.kind == \$k)
+          | \"\\(.metadata.namespace)/\\(.spec.sourceRef.name)\"" "$list" | sort -u)
+      if [[ ${#ups[@]} -gt 0 ]]; then
+        up_resource="$(resource_of "$up_kind")"
+        reconcile_and_wait "$up_resource" "${ups[@]}"
+      fi
+    done
+  fi
+  reconcile_and_wait "$resource" "${objs[@]}"
+}
 
 # --- Connect to source-controller -------------------------------------------
 if [[ -z "$BASE_URL" ]]; then
@@ -108,18 +194,22 @@ for kind in "${kinds[@]}"; do
   case "$kind" in
     helmchart) resource="helmcharts.source.toolkit.fluxcd.io";      dir="helmcharts" ;;
     oci)       resource="ocirepositories.source.toolkit.fluxcd.io"; dir="ocirepositories" ;;
-    git)       resource="gitrepositories.source.toolkit.fluxcd.io"; dir="gitrepositories" ;;
     bucket)    resource="buckets.source.toolkit.fluxcd.io";         dir="buckets" ;;
-    *) echo "error: unknown kind '$kind' (use helmchart, oci, git, bucket)" >&2; exit 2 ;;
+    *) echo "error: unknown kind '$kind' (use helmchart, oci, bucket)" >&2; exit 2 ;;
   esac
 
   if ! "${KUBECTL[@]}" get "$resource" "${NS_ARGS[@]}" -o json >"$TMP/list.json" 2>"$TMP/err"; then
     echo "warning: cannot list $resource: $(tail -1 "$TMP/err")" >&2
     continue
   fi
+  if $RECONCILE; then
+    reconcile_not_ready "$kind" "$resource" "$TMP/list.json"
+    "${KUBECTL[@]}" get "$resource" "${NS_ARGS[@]}" -o json >"$TMP/list.json"
+  fi
 
   # One row per source, fields separated by the ASCII unit separator (a tab would let
-  # `read` merge empty fields): namespace, name, artifact URL, revision, digest, origin.
+  # `read` merge empty fields): namespace, name, artifact URL, revision, digest, origin,
+  # Ready status and Ready message.
   # origin is where the artifact came from: chart name for HelmCharts, URL otherwise.
   jq -r '.items[] | [
       .metadata.namespace,
@@ -128,14 +218,20 @@ for kind in "${kinds[@]}"; do
       (.status.artifact.revision // ""),
       (.status.artifact.digest // .status.artifact.checksum // ""),
       (if .spec.chart then "\(.spec.sourceRef.kind)/\(.spec.sourceRef.name): \(.spec.chart)"
-       else (.spec.url // (.spec.endpoint // "") + "/" + (.spec.bucketName // "")) end)
+       else (.spec.url // (.spec.endpoint // "") + "/" + (.spec.bucketName // "")) end),
+      ('"$READY"'.status // "Unknown"),
+      (('"$READY"'.message // "") | gsub("[\\n\\t]"; " "))
     ] | join("\u001f")' "$TMP/list.json" >"$TMP/rows"
 
-  while IFS=$'\x1f' read -r ns name url revision digest origin; do
+  while IFS=$'\x1f' read -r ns name url revision digest origin ready message; do
     label="$kind $ns/$name"
+    reason="not ready${message:+: $message}"
     if [[ -z "$url" ]]; then
-      echo "skip  $label: no artifact yet (source not ready)" >&2
+      echo "skip  $label: no artifact ($reason)" >&2
       skipped=$((skipped + 1)); continue
+    fi
+    if [[ "$ready" != "True" ]]; then
+      echo "warn  $label: $reason; downloading its last good artifact" >&2
     fi
 
     path="/${url#*://*/}"                 # drop scheme and host: /helmchart/ns/name/file.tgz
