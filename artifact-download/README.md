@@ -16,7 +16,22 @@ Flux deployed. Use it to archive a release or to feed an air-gapped mirror.
 - It lists HelmCharts and OCIRepositories (`--kinds bucket` adds Buckets).
 - It downloads each artifact from the URL Flux recorded (`.status.artifact.url`), through a `kubectl port-forward` to `svc/source-controller`. When running inside the cluster, pass `--base-url http://source-controller.flux-system.svc` to skip the port-forward.
 - It checks each file's SHA-256 against `.status.artifact.digest` and discards any that don't match.
-- It writes everything to `<out>/<kind>/<namespace>/<name>/`, plus a `manifest.tsv` listing kind, namespace, name, revision, digest, origin and file.
+- It saves everything into one folder, with a single copy of each artifact (see [Output](#output)).
+
+## Output
+
+```
+flux-artifacts/
+├── cert-manager-v1.16.1.tgz          Helm charts, named as the chart packages them
+├── redis-20.1.0.tgz                  one file, even if several deployments use it
+├── redis-20.1.0-766e358ef2e5.tgz     same name, different content: digest suffix
+├── web-manifests-2026.10.2.tar.gz    OCI artifacts: <repository>-<tag>
+└── manifest.tsv                      which source uses which file
+```
+
+- **Shared charts:** sources that use an identical artifact share one file, and `manifest.tsv` lists each source against the file it uses.
+- **Name clashes:** if two different artifacts would get the same name (for example a forked chart with the same version), the second gets a short digest suffix, so nothing is overwritten.
+- **Re-runs:** running again into the same folder only downloads what's new or changed.
 
 The script exits non-zero if any download or digest check fails.
 
