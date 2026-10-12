@@ -7,6 +7,18 @@ It is built for multi-repo Flux setups, where a root repo syncs in repos owned b
 other teams. It never reads a Git repo. Everything comes from the cluster, so it
 works however each team lays out its repository.
 
+## Output
+
+By default the notes are a short summary:
+
+- **What changed:** for each repo, its version change with a compare link, followed by the charts and images that changed with it.
+- **Needs attention:** one line per problem, such as a failing Kustomization, a re-pushed tag or a missing digest.
+- **Deployed:** compact tables of the repos, Helm charts and images now running, with short digests. Full image references are in a collapsible block.
+
+`--format full`, or `--full-out FILE` alongside the summary, writes the detailed
+report: every source, Kustomization, HelmRelease and container, with delivery
+paths. The snapshot JSON always holds everything listed below.
+
 ## What gets recorded
 
 | Area | Recorded |
@@ -87,6 +99,8 @@ With `--previous`, the notes start with a **Changes since …** section. It list
 | `--images-out` | Plain list of unique full image references, e.g. for scanners |
 | `--out` | Markdown output file (default: stdout) |
 | `--title` | Heading for the notes |
+| `--format summary\|full` | Summary (default) or the detailed report for `--out` |
+| `--full-out` | Also write the detailed report to this file |
 
 ### About digests
 
@@ -103,7 +117,7 @@ don't need to create any tokens.
 
 | Pipeline | What happens |
 |---|---|
-| Tag (e.g. `v2026.10.2`) | Notes diffed against the last release, a GitLab Release is created with them, and the baseline snapshot is updated |
+| Tag (e.g. `v2026.10.2`) | Notes diffed against the last release, a GitLab Release is created with the summary, and the baseline snapshot is updated. The full report is kept as a job artifact |
 | Schedule or manual run | Preview notes against the last release, saved as job artifacts; baseline unchanged (set `UPDATE_BASELINE=true` to override) |
 
 Retrying a tag pipeline still diffs against the release before it.

@@ -521,10 +521,10 @@ def collect_images(kubectl, flux, namespace, excluded, include_unmanaged, resolv
         elif len(cur_digests) == 1:
             p["digest"], digest_source = cur_digests[0], "running pods"
         elif len(cur_digests) > 1:
-            warnings.append("pods run different digests for the same tag (tag was re-pushed): "
-                            + ", ".join(d[:19] for d in cur_digests))
+            warnings.append(f"tag was re-pushed; pods run {len(cur_digests)} different digests ("
+                            + ", ".join(d[7:19] for d in cur_digests) + ")")
         elif any(r["image_id"] for r in current):
-            warnings.append("runtime reported only a local image ID, not a registry digest")
+            warnings.append("node reported no registry digest")
         if not p["digest"] and not cur_digests and resolver is not None:
             d, err = resolver(image_string(p, with_digest=False))
             if d:
@@ -534,7 +534,8 @@ def collect_images(kubectl, flux, namespace, excluded, include_unmanaged, resolv
         if not p["digest"] and not warnings:
             warnings.append("digest unknown" + ("" if running else " (no pods running)"))
         if stale:
-            warnings.append(f"{sum(r['pods'] for r in stale)} pod(s) still run an older spec: "
+            n = sum(r["pods"] for r in stale)
+            warnings.append(f"rollout in progress: {n} pod{'s' if n != 1 else ''} still on "
                             + ", ".join(sorted({r['image'] for r in stale})))
         e.update(p)
         e.update({
@@ -731,6 +732,184 @@ def render_changes(snap, prev, forges):
     return L or ["No source, chart or image changes.", ""]
 
 
+def collect_warnings(snap):
+    """[(subject, message)] for everything that needs a human to look at it."""
+    sources, ks, hrs = snap["sources"], snap["kustomizations"], snap["helmreleases"]
+    out = []
+    for k, s in sorted(sources.items()):
+        if s["ready"] != "True":
+            out.append((pretty(k), f"not ready: {s['message'] or s['ready']}"))
+    for k, o in sorted({**ks, **hrs}.items()):
+        if o["suspended"]:
+            out.append((pretty(k), "suspended"))
+        elif o["ready"] != "True":
+            out.append((pretty(k), f"not ready: {o['message'] or o['ready']}"))
+    for k, o in sorted(ks.items()):
+        src = sources.get(o["source"])
+        if src and src["revision"] and o["applied_revision"] and src["revision"] != o["applied_revision"]:
+            out.append((pretty(k), f"behind its source: applied {short_version(o['applied_revision'])}, "
+                                   f"source is at {short_version(src['revision'])}"))
+    for e in snap["images"]:
+        for w in e["warnings"]:
+            out.append((f"{e['namespace']}/{e['name']} ({e['container']})", w))
+    return out
+
+
+# --- Summary format -------------------------------------------------------- #
+def short_version(revision):
+    """'refs/tags/v1.2@sha1:abcdef..' -> 'v1.2 (abcdef1)'; 'main@sha1:..' -> 'main (abcdef1)'."""
+    ref, h = parse_revision(revision)
+    ref = re.sub(r"^refs/(tags|heads)/", "", ref)
+    h = bare_hash(h)[:7]
+    if ref and h:
+        return f"{ref} ({h})"
+    return ref or h or "-"
+
+
+def repo_label(skey, sources):
+    """Human name for a source: the repository path from its URL."""
+    s = sources.get(skey)
+    if not skey:
+        return "Not managed by Flux"
+    if not s or not s.get("url"):
+        return pretty(skey)
+    path = urlsplit(web_url(s["url"])).path.strip("/")
+    return path or pretty(skey)
+
+
+def image_label(e):
+    """Short image name for summaries: last path segment of the repository."""
+    return e["repository"].rsplit("/", 1)[-1]
+
+
+def tag_or_digest(e):
+    if not e:
+        return "-"
+    return e["tag"] or (e["digest"].replace("sha256:", "")[:7] if e["digest"] else "-")
+
+
+def render_summary(snap, prev=None, title=None, forges=None):
+    forges = forges or {}
+    sources, ks, hrs, images = snap["sources"], snap["kustomizations"], snap["helmreleases"], snap["images"]
+    lookup = {**ks, **hrs}
+    heading = title or (f"Release {snap['release']}" if snap.get("release") else "Release notes")
+    meta = [f"`{snap['context']}`", f"Kubernetes {snap['kubernetes_version']}", f"Flux {snap['flux_version']}",
+            snap["generated_at"][:16] + " UTC"]
+    if prev:
+        meta.append(f"compared with {prev.get('release') or prev['generated_at'][:16]}")
+    L = [f"# {esc(heading)}", "", " · ".join(meta), ""]
+
+    # ---- What changed, grouped by the repo that delivers it ----
+    if prev:
+        psources = prev["sources"]
+        all_sources = {**psources, **sources}
+        groups = defaultdict(lambda: {"source": None, "lines": []})
+
+        for k in sorted(set(sources) | set(psources)):
+            a, b = psources.get(k), sources.get(k)
+            if (a or b)["kind"] == "HelmRepository":
+                continue
+            if a and b and (a["url"], a["ref"], a["hash"]) == (b["url"], b["ref"], b["hash"]):
+                continue
+            if a and b:
+                link = compare_link(b["url"], bare_hash(a["hash"]), bare_hash(b["hash"]), forges) \
+                    if b["kind"] == "GitRepository" else ""
+                groups[k]["source"] = f"{short_version(a['revision'])} → {short_version(b['revision'])}" \
+                                      + (f" ({link})" if link else "")
+            else:
+                groups[k]["source"] = "new source" if b else "source removed"
+
+        phrs = prev["helmreleases"]
+        for k in sorted(set(hrs) | set(phrs)):
+            a, b = phrs.get(k), hrs.get(k)
+            if a and b and all(a.get(f) == b.get(f) for f in ("chart", "chart_version", "chart_digest")):
+                continue
+            skey = resolve_delivery(lookup if b else {**prev["kustomizations"], **phrs}, k)[0]
+            name = (b or a)["chart"]
+            if a and b:
+                change = f"{a['chart_version']} → {b['chart_version']}"
+            else:
+                change = f"added, {b['chart_version']}" if b else "removed"
+            hr_name = k.split("|")[2]
+            label = f"`{esc(name)}`" + ("" if hr_name == name else f" ({esc(hr_name)})")
+            groups[skey]["lines"].append(f"Chart {label}: {change}")
+
+        for change, a, b in diff_images(prev["images"], images):
+            e = b or a
+            where = "" if image_label(e) == e["name"] else f" in {esc(e['name'])}"
+            if change == "Added":
+                text = f"`{esc(image_label(b))}:{esc(tag_or_digest(b))}` added{where}"
+            elif change == "Removed":
+                text = f"`{esc(image_label(a))}` removed{where}"
+            elif image_string(a, False) == image_string(b, False):
+                text = (f"`{esc(image_label(b))}` {esc(tag_or_digest(b))} re-pushed{where} "
+                        f"(digest {a['digest'][7:14]} → {b['digest'][7:14]})")
+            elif a["repository"] != b["repository"] or a["registry"] != b["registry"]:
+                text = f"`{esc(image_string(a, False))}` → `{esc(image_string(b, False))}`{where}"
+            else:
+                text = f"`{esc(image_label(b))}` {esc(tag_or_digest(a))} → {esc(tag_or_digest(b))}{where}"
+            groups[e["source"]]["lines"].append(text)
+
+        L += ["## What changed", ""]
+        if not groups:
+            L += ["Nothing changed since the last release.", ""]
+        for skey in sorted(groups, key=lambda s: (s == "", repo_label(s, all_sources))):
+            g = groups[skey]
+            line = f"**{esc(repo_label(skey, all_sources))}**"
+            if g["source"]:
+                line += f" — {g['source']}"
+            L.append(line)
+            L += [f"- {x}" for x in g["lines"]]
+            L.append("")
+
+    # ---- Needs attention ----
+    merged = {}
+    for subject, msg in collect_warnings(snap):
+        merged.setdefault(subject, []).append(msg)
+    warn = [(s, "; ".join(m)) for s, m in merged.items()]
+    if warn:
+        L += ["## Needs attention", ""]
+        L += [f"- **{esc(s)}**: {esc(m)}" for s, m in warn[:10]]
+        if len(warn) > 10:
+            L.append(f"- …and {len(warn) - 10} more (see the full report)")
+        L.append("")
+
+    # ---- What's deployed ----
+    L += ["## Deployed", ""]
+    repos = {k: s for k, s in sources.items() if s["kind"] in ("GitRepository", "OCIRepository", "Bucket")}
+    if repos:
+        L += ["| Repository | Version | Commit / digest |", "|---|---|---|"]
+        for k, s in sorted(repos.items(), key=lambda kv: repo_label(kv[0], sources)):
+            ref, h = parse_revision(s["revision"])
+            ref = re.sub(r"^refs/(tags|heads)/", "", ref)
+            hcell = commit_link(s["url"], bare_hash(h), forges) if s["kind"] == "GitRepository" \
+                else code(bare_hash(h)[:12])
+            L.append(f"| {esc(repo_label(k, sources))} | {code(ref)} | {hcell} |")
+        L.append("")
+    if hrs:
+        L += ["| Helm chart | Release | Version |", "|---|---|---|"]
+        for k, h in sorted(hrs.items(), key=lambda kv: (kv[1]["chart"], kv[0])):
+            L.append(f"| {code(h['chart'])} | {esc(h['target_namespace'] + '/' + h['release_name'])} | "
+                     f"{code(h['chart_version'])} |")
+        L.append("")
+    if images:
+        used = defaultdict(set)
+        by_ref = {}
+        for e in images:
+            used[e["image"]].add(e["name"])
+            by_ref[e["image"]] = e
+        L += ["| Image | Tag | Digest | Used by |", "|---|---|---|---|"]
+        for ref, e in sorted(by_ref.items(), key=lambda kv: (image_label(kv[1]), kv[0])):
+            names = sorted(used[ref])
+            who = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
+            L.append(f"| {esc(image_label(e))} | {code(e['tag'])} | "
+                     f"{code(e['digest'][7:19]) if e['digest'] else '⚠️ unknown'} | {esc(who)} |")
+        L.append("")
+        L += ["<details><summary>Full image references</summary>", "", "```"]
+        L += sorted(by_ref) + ["```", "", "</details>", ""]
+    return "\n".join(L)
+
+
 def render_markdown(snap, prev=None, title=None, forges=None):
     forges = forges or {}
     sources, ks, hrs, images = snap["sources"], snap["kustomizations"], snap["helmreleases"], snap["images"]
@@ -754,26 +933,9 @@ def render_markdown(snap, prev=None, title=None, forges=None):
         L += [f"## Changes since {prev.get('release') or 'previous snapshot'}", ""]
         L += render_changes(snap, prev, forges)
 
-    # Warnings
-    warn = []
-    for k, s in sorted(sources.items()):
-        if s["ready"] != "True":
-            warn.append(f"- {esc(pretty(k))} not ready: {esc(s['message'] or s['ready'])}")
-    for k, o in sorted({**ks, **hrs}.items()):
-        if o["suspended"]:
-            warn.append(f"- {esc(pretty(k))} is suspended")
-        elif o["ready"] != "True":
-            warn.append(f"- {esc(pretty(k))} not ready: {esc(o['message'] or o['ready'])}")
-    for k, o in sorted(ks.items()):
-        src = sources.get(o["source"])
-        if src and src["revision"] and o["applied_revision"] and src["revision"] != o["applied_revision"]:
-            warn.append(f"- {esc(pretty(k))} applied `{esc(o['applied_revision'])}` but its source is at "
-                        f"`{esc(src['revision'])}` (not yet applied, or failing)")
-    for e in images:
-        for w in e["warnings"]:
-            warn.append(f"- {esc(e['namespace'])}/{e['kind']}/{esc(e['name'])} `{esc(e['container'])}`: {esc(w)}")
+    warn = collect_warnings(snap)
     if warn:
-        L += ["## Warnings", "", *warn, ""]
+        L += ["## Warnings", "", *(f"- **{esc(s)}**: {esc(m)}" for s, m in warn), ""]
 
     # Sources
     L += ["## Flux sources", ""]
@@ -881,6 +1043,10 @@ def main():
     p.add_argument("--images-out", help="write the unique full image references, one per line, here")
     p.add_argument("--out", help="write Markdown here (default: stdout)")
     p.add_argument("--title", help="heading for the release notes")
+    p.add_argument("--format", choices=["summary", "full"], default="summary",
+                   help="summary (default): what changed, what needs attention, what is deployed; "
+                        "full: every source, Kustomization, HelmRelease and container in detail")
+    p.add_argument("--full-out", help="also write the full report here")
     args = p.parse_args()
 
     forges = {}
@@ -928,7 +1094,11 @@ def main():
         with open(args.images_out, "w") as fh:
             fh.write("\n".join(sorted({e["image"] for e in snapshot["images"]})) + "\n")
 
-    md = render_markdown(snapshot, previous, args.title, forges)
+    if args.full_out:
+        with open(args.full_out, "w") as fh:
+            fh.write(render_markdown(snapshot, previous, args.title, forges) + "\n")
+    render = render_summary if args.format == "summary" else render_markdown
+    md = render(snapshot, previous, args.title, forges)
     if args.out:
         with open(args.out, "w") as fh:
             fh.write(md + "\n")
