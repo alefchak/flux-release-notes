@@ -751,7 +751,8 @@ def collect_warnings(snap):
                                    f"source is at {short_version(src['revision'])}"))
     for e in snap["images"]:
         for w in e["warnings"]:
-            out.append((f"{e['namespace']}/{e['name']} ({e['container']})", w))
+            ctr = "" if e["container"] == e["name"] else f" ({e['container']})"
+            out.append((f"{e['namespace']}/{e['name']}{ctr}", w))
     return out
 
 
@@ -778,8 +779,8 @@ def repo_label(skey, sources):
 
 
 def image_label(e):
-    """Short image name for summaries: last path segment of the repository."""
-    return e["repository"].rsplit("/", 1)[-1]
+    """Short image name for summaries: the last two path segments ('acme/api')."""
+    return "/".join(e["repository"].split("/")[-2:])
 
 
 def tag_or_digest(e):
@@ -820,6 +821,7 @@ def render_summary(snap, prev=None, title=None, forges=None):
                 groups[k]["source"] = "new source" if b else "source removed"
 
         phrs = prev["helmreleases"]
+        chart_line, nested = {}, defaultdict(list)
         for k in sorted(set(hrs) | set(phrs)):
             a, b = phrs.get(k), hrs.get(k)
             if a and b and all(a.get(f) == b.get(f) for f in ("chart", "chart_version", "chart_digest")):
@@ -833,10 +835,11 @@ def render_summary(snap, prev=None, title=None, forges=None):
             hr_name = k.split("|")[2]
             label = f"`{esc(name)}`" + ("" if hr_name == name else f" ({esc(hr_name)})")
             groups[skey]["lines"].append(f"Chart {label}: {change}")
+            chart_line[k] = (skey, len(groups[skey]["lines"]) - 1)
 
         for change, a, b in diff_images(prev["images"], images):
             e = b or a
-            where = "" if image_label(e) == e["name"] else f" in {esc(e['name'])}"
+            where = "" if e["repository"].rsplit("/", 1)[-1] == e["name"] else f" in {esc(e['name'])}"
             if change == "Added":
                 text = f"`{esc(image_label(b))}:{esc(tag_or_digest(b))}` added{where}"
             elif change == "Removed":
@@ -848,7 +851,10 @@ def render_summary(snap, prev=None, title=None, forges=None):
                 text = f"`{esc(image_string(a, False))}` → `{esc(image_string(b, False))}`{where}"
             else:
                 text = f"`{esc(image_label(b))}` {esc(tag_or_digest(a))} → {esc(tag_or_digest(b))}{where}"
-            groups[e["source"]]["lines"].append(text)
+            if e["owner"] in chart_line:  # caused by a chart upgrade: list it under the chart
+                nested[chart_line[e["owner"]]].append(text)
+            else:
+                groups[e["source"]]["lines"].append(text)
 
         L += ["## What changed", ""]
         if not groups:
@@ -859,7 +865,9 @@ def render_summary(snap, prev=None, title=None, forges=None):
             if g["source"]:
                 line += f" — {g['source']}"
             L.append(line)
-            L += [f"- {x}" for x in g["lines"]]
+            for i, x in enumerate(g["lines"]):
+                L.append(f"- {x}")
+                L += [f"  - {y}" for y in nested.get((skey, i), [])]
             L.append("")
 
     # ---- Needs attention ----
