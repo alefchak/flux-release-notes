@@ -907,16 +907,11 @@ def render_summary(snap, prev=None, title=None, forges=None):
             used[e["image"]].add(e["name"])
             by_ref[e["image"]] = e
         L += ["| Image | Tag | Digest | Used by |", "|---|---|---|---|"]
-        for ref, e in sorted(by_ref.items(), key=lambda kv: (image_label(kv[1]), kv[0])):
+        for ref, e in sorted(by_ref.items(), key=lambda kv: (kv[1]["registry"] + "/" + kv[1]["repository"], kv[0])):
             names = sorted(used[ref])
             who = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
-            L.append(f"| {esc(image_label(e))} | {code(e['tag'])} | "
-                     f"{code(e['digest'][7:19]) if e['digest'] else '⚠️ unknown'} | {esc(who)} |")
-        L.append("")
-        L += ["### Full image references", "", "| Image | Tag | Digest |", "|---|---|---|"]
-        for ref, e in sorted(by_ref.items()):
             L.append(f"| {code(e['registry'] + '/' + e['repository'])} | {code(e['tag'])} | "
-                     f"{code(e['digest']) if e['digest'] else '⚠️ unknown'} |")
+                     f"{code(e['digest']) if e['digest'] else '⚠️ unknown'} | {esc(who)} |")
         L.append("")
     return "\n".join(L)
 
