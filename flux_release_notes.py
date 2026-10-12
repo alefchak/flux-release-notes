@@ -1,44 +1,46 @@
 #!/usr/bin/env python3
 """
-Generate release notes from the container images running in a Kubernetes
-cluster whose workloads are managed by FluxCD.
+Generate release notes for a Kubernetes cluster whose workloads are deployed by
+FluxCD, built for multi-repo setups (a root repo that syncs in other teams' repos).
 
-Designed for multi-repo Flux setups (a root repo that syncs in other teams'
-repos). It never reads any Git repo: everything is derived from the cluster,
-so it works regardless of how each team lays out its repository.
+Nothing is read from Git. Everything comes from the cluster, so it works however
+each team lays out its repository.
 
-How ownership is resolved
-  workload --labels--> HelmRelease or Kustomization that applied it
-  HelmRelease --labels--> Kustomization that applied the HelmRelease
+Recorded for every release
+  * Every container image as a full reference: registry/repository:tag@sha256:digest.
+    The digest comes from the image reference itself (pinned), from what the
+    running pods report, or, with --resolve-digests, from the registry.
+  * Every HelmRelease: chart name, deployed chart version, app version, the
+    version constraint requested, chart source URL and OCI chart digest.
+  * Every Flux source: GitRepository URL, ref (branch/tag/semver/commit), the
+    resolved tag or branch and full commit SHA; OCIRepository URL, tag and digest;
+    Buckets and HelmRepositories.
+  * Every Kustomization: source, path and the revision it last applied.
+
+How workloads are traced to the repo that delivers them
+  Pod --ownerReferences--> ReplicaSet/Job --> Deployment/CronJob/... --> any CR owner
+  workload --Flux labels--> HelmRelease or Kustomization that applied it
+  HelmRelease --labels--> Kustomization that applied it
   Kustomization --spec.sourceRef--> GitRepository / OCIRepository / Bucket
   Kustomization --labels--> parent Kustomization ... up to the root
 
-The nearest Kustomization's source is treated as the "delivering repo" (i.e.
-the team repo), and the full chain is shown so you can see how it got there.
-
-Output
-  * Markdown release notes grouped by source repo, then by Flux object.
-  * A JSON snapshot. Pass a previous one with --previous to get a "what changed"
-    section: source revision changes (with GitHub/GitLab compare links),
-    image updates/additions/removals per repo, and Helm chart version changes.
-
-Requirements: Python 3.8+, kubectl on PATH with read access to the cluster.
-
-Examples
-  ./flux_release_notes.py --snapshot-out snapshots/r1.json --out RELEASE_NOTES.md
-  ./flux_release_notes.py --previous snapshots/r1.json \
-      --snapshot-out snapshots/r2.json --out RELEASE_NOTES.md --title "Release 2026.10.2"
+Requirements: Python 3.8+, kubectl with read access to the cluster.
+Optional: `crane` or `skopeo` on PATH for --resolve-digests.
 """
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
+from urllib.parse import urlsplit, urlunsplit
 
-WORKLOAD_KINDS = "deployments,statefulsets,daemonsets,cronjobs"
+SCHEMA = 2
+TEMPLATE_RESOURCES = "deployments,statefulsets,daemonsets,cronjobs,jobs,replicasets"
 DEFAULT_EXCLUDED_NAMESPACES = ["kube-system", "kube-public", "kube-node-lease"]
 
 KS_NAME = "kustomize.toolkit.fluxcd.io/name"
@@ -52,6 +54,8 @@ SOURCE_RESOURCES = {
     "Bucket": "buckets.source.toolkit.fluxcd.io",
     "HelmRepository": "helmrepositories.source.toolkit.fluxcd.io",
 }
+# Kinds that sit between a Pod and the object a person actually manages.
+INTERMEDIATE_KINDS = {"Pod", "ReplicaSet", "Job"}
 
 
 # --------------------------------------------------------------------------- #
@@ -77,15 +81,27 @@ class Kubectl:
         args = ["get", resource, "-o", "json"]
         args += ["-n", namespace] if namespace else ["-A"]
         out = self.run(args, allow_fail=allow_fail)
-        return json.loads(out)["items"] if out else []
+        return json.loads(out).get("items", []) if out else []
+
+    def get_one(self, resource, namespace, name):
+        args = ["get", resource, name, "-o", "json"] + (["-n", namespace] if namespace else [])
+        out = self.run(args, allow_fail=True)
+        return json.loads(out) if out else None
 
     def current_context(self):
         out = self.run(["config", "current-context"], allow_fail=True)
         return out.strip() if out else "unknown"
 
+    def server_version(self):
+        out = self.run(["version", "-o", "json"], allow_fail=True)
+        try:
+            return json.loads(out)["serverVersion"]["gitVersion"]
+        except (TypeError, ValueError, KeyError):
+            return "unknown"
+
 
 # --------------------------------------------------------------------------- #
-# Small helpers
+# Generic helpers
 # --------------------------------------------------------------------------- #
 def key(kind, ns, name):
     return f"{kind}|{ns}|{name}" if kind else ""
@@ -98,26 +114,11 @@ def pretty(k):
     return f"{kind} {ns}/{name}"
 
 
-def split_image(image):
-    """'reg.io/team/app:1.2.3@sha256:abc' -> ('reg.io/team/app', '1.2.3', 'sha256:abc')"""
-    digest = ""
-    if "@" in image:
-        image, digest = image.split("@", 1)
-    repo, tag = image, ""
-    if ":" in image.rsplit("/", 1)[-1]:
-        repo, tag = image.rsplit(":", 1)
-    return repo, tag or ("" if digest else "latest"), digest
-
-
-def digest_from_image_id(image_id):
-    return image_id.split("@", 1)[1] if "@" in (image_id or "") else ""
-
-
-def pod_spec(obj):
-    spec = obj.get("spec", {})
-    if obj["kind"] == "CronJob":
-        return spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec", {})
-    return spec.get("template", {}).get("spec", {})
+def condition(status):
+    for c in (status or {}).get("conditions", []) or []:
+        if c.get("type") == "Ready":
+            return c.get("status", "Unknown"), (c.get("message") or "").strip()
+    return "Unknown", ""
 
 
 def flux_owner(labels):
@@ -129,76 +130,246 @@ def flux_owner(labels):
     return ""
 
 
-def ready_state(status):
-    for c in status.get("conditions", []):
-        if c.get("type") == "Ready":
-            return c.get("status", "Unknown")
-    return "Unknown"
-
-
 def ref_key(ref, default_ns):
     ref = ref or {}
     return key(ref.get("kind", ""), ref.get("namespace") or default_ns, ref.get("name", ""))
 
 
+def clean_url(url):
+    """Drop credentials embedded in a URL (https://user:token@host/...)."""
+    if not url:
+        return ""
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return url
+    if "@" not in p.netloc:
+        return url
+    host = p.netloc.rsplit("@", 1)[1]
+    if p.scheme in ("http", "https", "oci", "s3", "gs"):
+        return urlunsplit((p.scheme, host, p.path, p.query, p.fragment))
+    # ssh://git@host/...: keep the user name, drop any password
+    return urlunsplit((p.scheme, f"{p.username}@{host}" if p.username else host, p.path, p.query, p.fragment))
+
+
+def parse_revision(rev):
+    """Flux artifact revision -> (ref name, 'algo:hash').
+
+    'main@sha1:abc..', 'v1.2.3@sha1:abc..', 'sha1:abc..', 'latest@sha256:..',
+    and the legacy 'main/abc..' form."""
+    rev = rev or ""
+    m = re.match(r"^(?:(.*)@)?((?:sha1|sha256|sha384|sha512):[0-9a-f]+)$", rev)
+    if m:
+        return m.group(1) or "", m.group(2)
+    m = re.match(r"^(.*)/([0-9a-f]{40})$", rev)
+    if m:
+        return m.group(1), f"sha1:{m.group(2)}"
+    return rev, ""
+
+
+def bare_hash(h):
+    return h.split(":", 1)[1] if ":" in (h or "") else (h or "")
+
+
+def fmt_ref(ref):
+    return ", ".join(f"{k} `{v}`" for k, v in (ref or {}).items()) or "default"
+
+
+def esc(s):
+    return str(s if s is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def code(s):
+    return f"`{esc(s)}`" if s else "-"
+
+
 # --------------------------------------------------------------------------- #
-# Collection
+# Image references
+# --------------------------------------------------------------------------- #
+def parse_image(image):
+    """Normalise an image reference the way container runtimes do.
+
+    'redis:7' -> docker.io / library/redis / 7
+    'ghcr.io/acme/api:1.2@sha256:..' -> ghcr.io / acme/api / 1.2 / sha256:..
+    """
+    ref, digest = (image or "").strip(), ""
+    if "@" in ref:
+        ref, digest = ref.split("@", 1)
+    name, tag = ref, ""
+    if ":" in ref.rsplit("/", 1)[-1]:
+        name, tag = ref.rsplit(":", 1)
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, repo = first, rest
+    else:
+        registry, repo = "docker.io", name
+    if registry in ("index.docker.io", "registry-1.docker.io"):
+        registry = "docker.io"
+    if registry == "docker.io" and "/" not in repo:
+        repo = f"library/{repo}"
+    if not tag and not digest:
+        tag = "latest"
+    return {"registry": registry, "repository": repo, "tag": tag, "digest": digest}
+
+
+def image_string(p, with_digest=True):
+    s = f"{p['registry']}/{p['repository']}"
+    if p["tag"]:
+        s += f":{p['tag']}"
+    if with_digest and p["digest"]:
+        s += f"@{p['digest']}"
+    return s
+
+
+def parse_image_id(image_id):
+    """containerStatus.imageID -> (registry digest, local image id).
+
+    'docker-pullable://repo@sha256:..' / 'repo@sha256:..' carry a registry
+    (manifest) digest. A bare 'sha256:..' is only the local image config ID,
+    which cannot be used to pull the image, so it is kept separately."""
+    iid = re.sub(r"^[a-z-]+://", "", image_id or "")
+    if "@" in iid:
+        return iid.split("@", 1)[1], ""
+    if iid.startswith("sha256:"):
+        return "", iid
+    return "", ""
+
+
+class DigestResolver:
+    """Looks up the manifest digest of a tag in the registry (crane or skopeo)."""
+
+    def __init__(self, mode):
+        self.tool, self.cache = None, {}
+        if mode in ("crane", "skopeo"):
+            if not shutil.which(mode):
+                sys.exit(f"--resolve-digests {mode}: '{mode}' is not on PATH")
+            self.tool = mode
+        elif mode == "auto":
+            self.tool = next((t for t in ("crane", "skopeo") if shutil.which(t)), None)
+            if not self.tool:
+                print("warning: --resolve-digests auto: neither crane nor skopeo found; skipping", file=sys.stderr)
+
+    def __call__(self, ref):
+        if not self.tool:
+            return "", "no crane/skopeo available"
+        if ref not in self.cache:
+            self.cache[ref] = self._lookup(ref)
+        return self.cache[ref]
+
+    def _lookup(self, ref):
+        try:
+            if self.tool == "crane":
+                p = subprocess.run(["crane", "digest", ref], capture_output=True, text=True, timeout=90)
+                if p.returncode == 0 and p.stdout.strip().startswith("sha256:"):
+                    return p.stdout.strip(), ""
+                return "", (p.stderr.strip().splitlines() or ["lookup failed"])[-1]
+            p = subprocess.run(["skopeo", "inspect", "--raw", f"docker://{ref}"], capture_output=True, timeout=90)
+            if p.returncode == 0 and p.stdout:
+                return "sha256:" + hashlib.sha256(p.stdout).hexdigest(), ""
+            return "", (p.stderr.decode(errors="replace").strip().splitlines() or ["lookup failed"])[-1]
+        except subprocess.TimeoutExpired:
+            return "", "registry lookup timed out"
+
+
+# --------------------------------------------------------------------------- #
+# Flux objects
 # --------------------------------------------------------------------------- #
 def collect_sources(kubectl):
     sources = {}
     for kind, resource in SOURCE_RESOURCES.items():
         for s in kubectl.get_json(resource, allow_fail=True):
             md, spec, st = s["metadata"], s.get("spec", {}), s.get("status", {})
-            ref = spec.get("ref", {}) or {}
-            ref_s = next((f"{k} {ref[k]}" for k in ("tag", "semver", "branch", "name", "commit", "digest")
-                          if ref.get(k)), "")
+            ready, msg = condition(st)
+            revision = (st.get("artifact") or {}).get("revision", "")
+            resolved, rev_hash = parse_revision(revision)
+            url = spec.get("url", "")
+            if kind == "Bucket":
+                url = f"{spec.get('endpoint', '')}/{spec.get('bucketName', '')}"
             sources[key(kind, md["namespace"], md["name"])] = {
-                "url": spec.get("url") or spec.get("bucketName", ""),
-                "ref": ref_s,
-                "revision": (st.get("artifact") or {}).get("revision", ""),
-                "ready": ready_state(st),
+                "kind": kind,
+                "url": clean_url(url),
+                "ref": {k: v for k, v in (spec.get("ref") or {}).items() if v and isinstance(v, str)},
+                "type": spec.get("type", ""),              # HelmRepository: "oci" or "default"
+                "revision": revision,
+                "resolved_ref": resolved,                  # branch / tag the revision points at
+                "hash": rev_hash,                          # sha1:<commit> or sha256:<digest>
+                "suspended": bool(spec.get("suspend")),
+                "ready": ready,
+                "message": msg if ready != "True" else "",
             }
     return sources
 
 
-def collect_flux_objects(kubectl):
-    flux = {}
+def collect_kustomizations(kubectl):
+    out = {}
     for ks in kubectl.get_json("kustomizations.kustomize.toolkit.fluxcd.io", allow_fail=True):
         md, spec, st = ks["metadata"], ks.get("spec", {}), ks.get("status", {})
-        flux[key("Kustomization", md["namespace"], md["name"])] = {
+        ready, msg = condition(st)
+        out[key("Kustomization", md["namespace"], md["name"])] = {
             "parent": flux_owner(md.get("labels")),
             "source": ref_key(spec.get("sourceRef"), md["namespace"]),
-            "path": spec.get("path", ""),
-            "revision": st.get("lastAppliedRevision", ""),
-            "ready": ready_state(st),
+            "path": spec.get("path", "") or "./",
+            "applied_revision": st.get("lastAppliedRevision", ""),
+            "attempted_revision": st.get("lastAttemptedRevision", ""),
+            "suspended": bool(spec.get("suspend")),
+            "ready": ready,
+            "message": msg if ready != "True" else "",
         }
+    return out
+
+
+def collect_helmreleases(kubectl):
+    out = {}
     for hr in kubectl.get_json("helmreleases.helm.toolkit.fluxcd.io", allow_fail=True):
         md, spec, st = hr["metadata"], hr.get("spec", {}), hr.get("status", {})
+        ready, msg = condition(st)
         chart_spec = (spec.get("chart") or {}).get("spec", {})
-        chart_src = ref_key(chart_spec.get("sourceRef"), md["namespace"]) if chart_spec \
-            else ref_key(spec.get("chartRef"), md["namespace"])
+        if chart_spec:
+            chart_source = ref_key(chart_spec.get("sourceRef"), md["namespace"])
+            requested = chart_spec.get("version") or "*"
+            chart_ref = chart_spec.get("chart", "")
+        else:  # spec.chartRef -> OCIRepository or HelmChart
+            chart_source = ref_key(spec.get("chartRef"), md["namespace"])
+            requested, chart_ref = "", ""
         history = st.get("history") or []
-        if history:  # helm.toolkit.fluxcd.io/v2
-            chart = history[0].get("chartName", chart_spec.get("chart", ""))
-            version = history[0].get("chartVersion", "")
-            app_version = history[0].get("appVersion", "")
-        else:        # v2beta1/v2beta2
-            chart = chart_spec.get("chart", "")
-            version = st.get("lastAppliedRevision") or st.get("lastAttemptedRevision", "")
-            app_version = ""
-        flux[key("HelmRelease", md["namespace"], md["name"])] = {
+        target_ns = spec.get("targetNamespace") or md["namespace"]
+        default_release = f"{spec['targetNamespace']}-{md['name']}" if spec.get("targetNamespace") else md["name"]
+        if history:  # helm.toolkit.fluxcd.io/v2 and v2beta2
+            h = history[0]
+            chart = h.get("chartName") or chart_ref
+            version, app_version = h.get("chartVersion", ""), h.get("appVersion", "")
+            chart_digest = h.get("ociDigest", "")
+            release_name = h.get("name") or spec.get("releaseName") or default_release
+            helm_status, deployed_at = h.get("status", ""), h.get("lastDeployed", "")
+        else:        # v2beta1: lastAppliedRevision is the chart version
+            chart = chart_ref
+            version = st.get("lastAppliedRevision", "")
+            app_version = chart_digest = deployed_at = ""
+            release_name = spec.get("releaseName") or default_release
+            helm_status = ""
+        out[key("HelmRelease", md["namespace"], md["name"])] = {
             "parent": flux_owner(md.get("labels")),
-            "source": chart_src,
+            "source": chart_source,
             "chart": chart,
+            "chart_path": chart_ref if chart_source.startswith("GitRepository|") else "",
             "chart_version": version,
             "app_version": app_version,
-            "ready": ready_state(st),
+            "requested_version": requested,
+            "chart_digest": chart_digest,
+            "release_name": release_name,
+            "target_namespace": target_ns,
+            "helm_status": helm_status,
+            "deployed_at": deployed_at,
+            "attempted_revision": st.get("lastAttemptedRevision", ""),
+            "suspended": bool(spec.get("suspend")),
+            "ready": ready,
+            "message": msg if ready != "True" else "",
         }
-    return flux
+    return out
 
 
-def resolve(flux, owner):
-    """Return (delivering source key, chain of Flux keys from root to owner)."""
+def resolve_delivery(flux, owner):
+    """(source key of the repo that delivered it, chain of Flux keys root -> owner)."""
     chain, seen, cur, delivering = [], set(), owner, ""
     while cur and cur not in seen:
         seen.add(cur)
@@ -209,53 +380,212 @@ def resolve(flux, owner):
         if not delivering and cur.startswith("Kustomization|"):
             delivering = obj["source"]
         cur = obj["parent"]
-    if not delivering and owner in flux:  # HelmRelease applied outside a Kustomization
+    if not delivering and owner in flux:  # HelmRelease not applied by a Kustomization
         delivering = flux[owner]["source"]
     return delivering, list(reversed(chain))
 
 
-def collect_running_digests(kubectl, namespace):
-    digests = defaultdict(set)
-    for pod in kubectl.get_json("pods", namespace):
-        ns = pod["metadata"]["namespace"]
+# --------------------------------------------------------------------------- #
+# Workloads and images
+# --------------------------------------------------------------------------- #
+def controller_ref(obj):
+    refs = obj["metadata"].get("ownerReferences") or []
+    return next((r for r in refs if r.get("controller")), refs[0] if refs else None)
+
+
+class OwnerGraph:
+    def __init__(self, kubectl, objs):
+        self.kubectl = kubectl
+        self.by_uid = {o["metadata"].get("uid"): o for o in objs}
+        self.fetched = {}
+
+    def _get(self, ns, ref):
+        uid = ref.get("uid")
+        if uid in self.by_uid:
+            return self.by_uid[uid]
+        if uid not in self.fetched:
+            api = ref.get("apiVersion", "")
+            group = api.split("/")[0] if "/" in api else ""
+            resource = ref["kind"].lower() + (f".{group}" if group else "")
+            obj = self.kubectl.get_one(resource, ns, ref["name"])
+            if obj is None:  # no permission or gone: keep a stub so the chain still names it
+                obj = {"kind": ref["kind"], "metadata": {"name": ref["name"], "namespace": ns,
+                                                         "uid": uid, "labels": {}}}
+            obj.setdefault("kind", ref["kind"])
+            self.fetched[uid] = obj
+        return self.fetched[uid]
+
+    def chain(self, obj):
+        """obj, its controller, that one's controller, ... (bottom -> top)."""
+        out, seen = [obj], {obj["metadata"].get("uid")}
+        while True:
+            ref = controller_ref(out[-1])
+            if not ref or ref.get("uid") in seen or ref.get("kind") == "Node":
+                return out
+            seen.add(ref.get("uid"))
+            out.append(self._get(out[-1]["metadata"].get("namespace"), ref))
+
+    def workload(self, obj):
+        """The object a person manages: skip Pods/ReplicaSets/Jobs that have a controller."""
+        chain = self.chain(obj)
+        for i, o in enumerate(chain):
+            if o["kind"] in INTERMEDIATE_KINDS and i + 1 < len(chain):
+                continue
+            return o, chain
+        return chain[-1], chain
+
+
+def pod_template_spec(obj):
+    spec = obj.get("spec", {})
+    if obj["kind"] == "CronJob":
+        return spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec", {})
+    if obj["kind"] == "Pod":
+        return spec
+    return spec.get("template", {}).get("spec", {})
+
+
+def containers_of(spec):
+    for c in spec.get("initContainers") or []:
+        yield c, "sidecar" if c.get("restartPolicy") == "Always" else "init"
+    for c in spec.get("containers") or []:
+        yield c, "container"
+
+
+def collect_images(kubectl, flux, namespace, excluded, include_unmanaged, resolver):
+    objs = kubectl.get_json(TEMPLATE_RESOURCES, namespace)
+    pods = kubectl.get_json("pods", namespace)
+    graph = OwnerGraph(kubectl, objs)
+    entries = {}
+
+    def entry(workload, chain, cname, ctype, spec_image):
+        md = workload["metadata"]
+        k = (md["namespace"], workload["kind"], md["name"], cname)
+        if k not in entries:
+            owner = ""
+            for o in reversed(chain):  # outermost Flux label wins
+                owner = flux_owner(o["metadata"].get("labels"))
+                if owner:
+                    break
+            top = chain[-1]
+            source, flux_chain = resolve_delivery(flux, owner) if owner else ("", [])
+            entries[k] = {
+                "namespace": md["namespace"], "kind": workload["kind"], "name": md["name"],
+                "controlled_by": f"{top['kind']}/{top['metadata']['name']}" if top is not workload else "",
+                "container": cname, "container_type": ctype, "spec_image": spec_image,
+                "owner": owner, "source": source, "chain": flux_chain,
+                "_running": Counter(),
+            }
+        return entries[k]
+
+    # Desired state: pod templates of workloads (covers scaled-to-zero and idle CronJobs).
+    for obj in objs:
+        if obj["metadata"]["namespace"] in excluded:
+            continue
+        if obj["kind"] in ("ReplicaSet", "Job") and controller_ref(obj):
+            continue  # its Deployment / CronJob / CR owner provides the template
+        workload, chain = graph.workload(obj)
+        if workload is not obj:
+            continue
+        for c, ctype in containers_of(pod_template_spec(obj)):
+            entry(workload, chain, c["name"], ctype, c.get("image", ""))
+
+    # Actual state: what pods run (also covers pods created by operators/CRs).
+    for pod in pods:
+        if pod["metadata"]["namespace"] in excluded:
+            continue
+        workload, chain = graph.workload(pod)
         st = pod.get("status", {})
-        for cs in st.get("containerStatuses", []) + st.get("initContainerStatuses", []):
-            d = digest_from_image_id(cs.get("imageID", ""))
+        statuses = {s.get("name"): s for s in
+                    (st.get("initContainerStatuses") or []) + (st.get("containerStatuses") or [])}
+        for c, ctype in containers_of(pod.get("spec", {})):
+            e = entry(workload, chain, c["name"], ctype, c.get("image", ""))
+            cs = statuses.get(c["name"], {})
+            digest, local_id = parse_image_id(cs.get("imageID", ""))
+            e["_running"][(c.get("image", ""), digest, local_id)] += 1
+
+    results = []
+    for e in entries.values():
+        if not e["owner"] and not include_unmanaged:
+            continue
+        running = [{"image": img, "digest": d, "image_id": lid, "pods": n}
+                   for (img, d, lid), n in sorted(e.pop("_running").items())]
+        p = parse_image(e["spec_image"])
+        current = [r for r in running if r["image"] == e["spec_image"]]
+        stale = [r for r in running if r["image"] != e["spec_image"]]
+        cur_digests = sorted({r["digest"] for r in current if r["digest"]})
+        warnings, digest_source = [], ""
+        if p["digest"]:
+            digest_source = "pinned"
+            if any(d != p["digest"] for d in cur_digests):
+                warnings.append("running digest differs from the pinned digest")
+        elif len(cur_digests) == 1:
+            p["digest"], digest_source = cur_digests[0], "running pods"
+        elif len(cur_digests) > 1:
+            warnings.append("pods run different digests for the same tag (tag was re-pushed): "
+                            + ", ".join(d[:19] for d in cur_digests))
+        elif any(r["image_id"] for r in current):
+            warnings.append("runtime reported only a local image ID, not a registry digest")
+        if not p["digest"] and not cur_digests and resolver is not None:
+            d, err = resolver(image_string(p, with_digest=False))
             if d:
-                digests[(ns, cs.get("image", ""))].add(d)
-    return digests
-
-
-def collect_images(kubectl, flux, namespace, excluded, include_unmanaged):
-    digests = collect_running_digests(kubectl, namespace)
-    entries = []
-    for obj in kubectl.get_json(WORKLOAD_KINDS, namespace):
-        md = obj["metadata"]
-        ns = md["namespace"]
-        if ns in excluded:
-            continue
-        owner = flux_owner(md.get("labels"))
-        if not owner and not include_unmanaged:
-            continue
-        source, chain = resolve(flux, owner) if owner else ("", [])
-        spec = pod_spec(obj)
-        containers = [(c, False) for c in spec.get("containers", [])]
-        containers += [(c, True) for c in spec.get("initContainers", [])]
-        for c, is_init in containers:
-            image = c.get("image", "")
-            repo, tag, pinned = split_image(image)
-            running = sorted(digests.get((ns, image), set()))
-            entries.append({
-                "namespace": ns, "kind": obj["kind"], "name": md["name"],
-                "container": c.get("name", ""), "init": is_init,
-                "image": image, "repository": repo, "tag": tag,
-                "digest": pinned or (running[0] if len(running) == 1 else ""),
-                "digest_mismatch": len(running) > 1,
-                "owner": owner, "source": source, "chain": chain,
-            })
-    entries.sort(key=lambda e: (e["source"] == "", e["source"], e["owner"],
+                p["digest"], digest_source = d, "registry"
+            else:
+                warnings.append(f"registry lookup failed: {err}")
+        if not p["digest"] and not warnings:
+            warnings.append("digest unknown" + ("" if running else " (no pods running)"))
+        if stale:
+            warnings.append(f"{sum(r['pods'] for r in stale)} pod(s) still run an older spec: "
+                            + ", ".join(sorted({r['image'] for r in stale})))
+        e.update(p)
+        e.update({
+            "image": image_string(p),
+            "digest_source": digest_source,
+            "pods": sum(r["pods"] for r in current),
+            "running": running,
+            "warnings": warnings,
+        })
+        results.append(e)
+    results.sort(key=lambda e: (e["source"] == "", e["source"], e["owner"],
                                 e["namespace"], e["kind"], e["name"], e["container"]))
-    return entries
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Git forge links
+# --------------------------------------------------------------------------- #
+def web_url(url):
+    u = (url or "").strip()
+    u = re.sub(r"^ssh://(?:[^@/]+@)?([^/:]+)(?::\d+)?/", r"https://\1/", u)
+    u = re.sub(r"^[^@/:]+@([^:/]+):", r"https://\1/", u)
+    return re.sub(r"\.git/?$", "", u)
+
+
+def forge_of(base, forges):
+    host = urlsplit(base).hostname or ""
+    if host in forges:
+        return forges[host]
+    return next((f for f in ("github", "gitlab", "bitbucket") if f in host), "")
+
+
+def commit_link(url, sha, forges):
+    base = web_url(url)
+    f = forge_of(base, forges)
+    if not sha or not base.startswith("https://") or not f:
+        return code(sha[:12]) if sha else "-"
+    path = {"github": "commit", "gitlab": "-/commit", "bitbucket": "commits"}[f]
+    return f"[`{sha[:12]}`]({base}/{path}/{sha})"
+
+
+def compare_link(url, old, new, forges):
+    base = web_url(url)
+    f = forge_of(base, forges)
+    if not (old and new and base.startswith("https://") and f):
+        return ""
+    return {
+        "github": f"[compare]({base}/compare/{old}...{new})",
+        "gitlab": f"[compare]({base}/-/compare/{old}...{new})",
+        "bitbucket": f"[compare]({base}/branches/compare/{new}%0D{old})",
+    }[f]
 
 
 # --------------------------------------------------------------------------- #
@@ -266,7 +596,6 @@ def entry_key(e):
 
 
 def diff_images(previous, current):
-    """Returns list of (change, before, after), change in Updated/Added/Removed."""
     prev = {entry_key(e): e for e in previous}
     curr = {entry_key(e): e for e in current}
     out = []
@@ -276,154 +605,256 @@ def diff_images(previous, current):
             out.append(("Removed", a, None))
         elif b and not a:
             out.append(("Added", None, b))
-        elif a["image"] != b["image"] or (a["digest"] and b["digest"] and a["digest"] != b["digest"]):
+        elif image_string(a, False) != image_string(b, False) or \
+                (a["digest"] and b["digest"] and a["digest"] != b["digest"]):
             out.append(("Updated", a, b))
     return out
 
 
-def git_sha(revision):
-    m = re.search(r"sha1:([0-9a-f]{7,40})$", revision or "") or re.search(r"/([0-9a-f]{40})$", revision or "")
-    return m.group(1) if m else ""
-
-
-def web_url(url):
-    u = (url or "").strip()
-    u = re.sub(r"^ssh://(?:[^@]+@)?([^/:]+)(?::\d+)?/", r"https://\1/", u)
-    u = re.sub(r"^[^@/]+@([^:/]+):", r"https://\1/", u)
-    return re.sub(r"\.git/?$", "", u)
-
-
-def compare_link(url, old_rev, new_rev):
-    old, new, base = git_sha(old_rev), git_sha(new_rev), web_url(url)
-    if not (old and new and base.startswith("https://")):
-        return ""
-    if "github" in base:
-        return f"[compare]({base}/compare/{old}...{new})"
-    if "gitlab" in base:
-        return f"[compare]({base}/-/compare/{old}...{new})"
-    if "bitbucket" in base:
-        return f"[compare]({base}/branches/compare/{new}%0D{old})"
-    return ""
+def diff_dict(prev, curr):
+    added = sorted(curr.keys() - prev.keys())
+    removed = sorted(prev.keys() - curr.keys())
+    common = sorted(curr.keys() & prev.keys())
+    return added, removed, common
 
 
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
-def short_rev(rev):
-    if not rev:
-        return "-"
-    m = re.match(r"^(.*?)@?(sha1|sha256):([0-9a-f]+)$", rev)
-    return f"{m.group(1)}@{m.group(3)[:12]}" if m else rev
-
-
-def fmt_version(e):
-    if not e:
-        return "-"
-    d = e["digest"].replace("sha256:", "")[:12] if e["digest"] else ""
-    return f"`{e['tag'] or '-'}`" + (f" ({d})" if d else "")
-
-
 def source_heading(skey, sources):
     if not skey:
         return "Not managed by Flux"
-    s = sources.get(skey, {})
-    return f"{pretty(skey)}" + (f" — {web_url(s['url'])}" if s.get("url") else "")
+    url = sources.get(skey, {}).get("url")
+    return pretty(skey) + (f" — {url}" if url else "")
 
 
-def render_markdown(snap, prev=None, title=None):
-    entries, flux, sources = snap["images"], snap["flux"], snap["sources"]
-    L = [f"# {title or 'Release notes'}", "",
+def git_ref_cell(s):
+    """'tag v1.2.3' / 'branch main' resolved from the artifact revision."""
+    r = s.get("resolved_ref", "")
+    if r.startswith("refs/tags/"):
+        return f"tag `{r[10:]}`"
+    if r.startswith("refs/heads/"):
+        return f"branch `{r[11:]}`"
+    if "tag" in s["ref"] or "semver" in s["ref"]:
+        return f"tag `{r}`" if r else "-"
+    return f"`{r}`" if r else "-"
+
+
+def requested_cell(hr, sources):
+    if hr["requested_version"]:
+        return code(hr["requested_version"])
+    src = sources.get(hr["source"])  # chartRef: the OCIRepository's ref decides the version
+    return fmt_ref(src["ref"]) if src else "-"
+
+
+def chart_source_cell(hr, sources):
+    s = sources.get(hr["source"], {})
+    label = pretty(hr["source"]) or "-"
+    detail = s.get("url", "")
+    if hr.get("chart_path"):
+        detail += f" path `{hr['chart_path']}`"
+    return esc(label) + (f"<br>{esc(detail)}" if detail else "")
+
+
+def render_changes(snap, prev, forges):
+    L = []
+    sources, psources = snap["sources"], prev["sources"]
+
+    # Git, OCI and Bucket sources
+    rows = []
+    added, removed, common = diff_dict(
+        {k: v for k, v in psources.items() if v["kind"] != "HelmRepository"},
+        {k: v for k, v in sources.items() if v["kind"] != "HelmRepository"})
+    for k in common:
+        a, b = psources[k], sources[k]
+        if (a["url"], a["ref"], a["hash"]) == (b["url"], b["ref"], b["hash"]):
+            continue
+        what = []
+        if a["url"] != b["url"]:
+            what.append(f"URL {esc(a['url'])} → {esc(b['url'])}")
+        if a["ref"] != b["ref"]:
+            what.append(f"ref {fmt_ref(a['ref'])} → {fmt_ref(b['ref'])}")
+        frm = f"{code(a['resolved_ref'])} {code(bare_hash(a['hash'])[:12])}"
+        to = f"{code(b['resolved_ref'])} {code(bare_hash(b['hash'])[:12])}"
+        link = compare_link(b["url"], bare_hash(a["hash"]), bare_hash(b["hash"]), forges) \
+            if b["kind"] == "GitRepository" else ""
+        rows.append(f"| {esc(pretty(k))} | {esc(b['url'])} | {frm} | {to} | {'; '.join(what + ([link] if link else []))} |")
+    for k in added:
+        b = sources[k]
+        rows.append(f"| {esc(pretty(k))} | {esc(b['url'])} | new | {code(b['resolved_ref'])} "
+                    f"{code(bare_hash(b['hash'])[:12])} | |")
+    for k in removed:
+        a = psources[k]
+        rows.append(f"| {esc(pretty(k))} | {esc(a['url'])} | {code(a['resolved_ref'])} "
+                    f"{code(bare_hash(a['hash'])[:12])} | removed | |")
+    if rows:
+        L += ["### Sources", "", "| Source | URL | From | To | Details |", "|---|---|---|---|---|", *rows, ""]
+
+    # Helm charts
+    hrs, phrs = snap["helmreleases"], prev["helmreleases"]
+    added, removed, common = diff_dict(phrs, hrs)
+    rows = []
+    for k in common:
+        a, b = phrs[k], hrs[k]
+        fields = ("chart", "chart_version", "app_version", "chart_digest", "source")
+        if any(a.get(f) != b.get(f) for f in fields):
+            rows.append(f"| Updated | {esc(pretty(k))} | {code(a['chart'])} {code(a['chart_version'])} "
+                        f"(app {code(a['app_version'])}) | {code(b['chart'])} {code(b['chart_version'])} "
+                        f"(app {code(b['app_version'])}) |")
+    for k in added:
+        b = hrs[k]
+        rows.append(f"| Added | {esc(pretty(k))} | - | {code(b['chart'])} {code(b['chart_version'])} "
+                    f"(app {code(b['app_version'])}) |")
+    for k in removed:
+        a = phrs[k]
+        rows.append(f"| Removed | {esc(pretty(k))} | {code(a['chart'])} {code(a['chart_version'])} | - |")
+    if rows:
+        L += ["### Helm charts", "", "| Change | HelmRelease | From | To |", "|---|---|---|---|", *rows, ""]
+
+    # Images, grouped by the repo that delivers them
+    changes = diff_images(prev["images"], snap["images"])
+    if changes:
+        L += ["### Images", ""]
+        all_sources = {**psources, **sources}
+        by_source = defaultdict(list)
+        for ch in changes:
+            by_source[(ch[2] or ch[1])["source"]].append(ch)
+        for skey in sorted(by_source, key=lambda s: (s == "", s)):
+            L += [f"#### {esc(source_heading(skey, all_sources))}", "",
+                  "| Change | Workload | Container | From | To |", "|---|---|---|---|---|"]
+            for change, a, b in by_source[skey]:
+                e = b or a
+                L.append(f"| {change} | {esc(e['namespace'])}/{e['kind']}/{esc(e['name'])} | "
+                         f"{esc(e['container'])} | {code(a['image']) if a else '-'} | "
+                         f"{code(b['image']) if b else '-'} |")
+            L.append("")
+    return L or ["No source, chart or image changes.", ""]
+
+
+def render_markdown(snap, prev=None, title=None, forges=None):
+    forges = forges or {}
+    sources, ks, hrs, images = snap["sources"], snap["kustomizations"], snap["helmreleases"], snap["images"]
+    git = {k: v for k, v in sources.items() if v["kind"] == "GitRepository"}
+    oci = {k: v for k, v in sources.items() if v["kind"] == "OCIRepository"}
+    buckets = {k: v for k, v in sources.items() if v["kind"] == "Bucket"}
+    helmrepos = {k: v for k, v in sources.items() if v["kind"] == "HelmRepository"}
+
+    L = [f"# {title or ('Release ' + snap['release'] if snap.get('release') else 'Release notes')}", "",
          f"- **Cluster context:** `{snap['context']}`",
-         f"- **Generated:** {snap['generated_at']}",
-         f"- **Source repos delivering workloads:** {len({e['source'] for e in entries if e['source']})}",
-         f"- **Workload containers:** {len(entries)} ({len({e['image'] for e in entries})} unique images)"]
+         f"- **Kubernetes:** `{snap['kubernetes_version']}`",
+         f"- **Flux:** `{snap['flux_version']}`",
+         f"- **Generated:** {snap['generated_at']}"]
     if prev:
-        L.append(f"- **Compared with snapshot from:** {prev['generated_at']}")
-    L.append("")
+        L.append(f"- **Compared with:** {prev.get('release') or 'snapshot'} ({prev['generated_at']})")
+    L += [f"- **Inventory:** {len(git)} Git repositories, {len(oci)} OCI repositories, "
+          f"{len(ks)} Kustomizations, {len(hrs)} HelmReleases, "
+          f"{len({e['image'] for e in images})} unique images in {len(images)} containers", ""]
 
     if prev:
-        L += ["## Changes since previous release", ""]
-        any_change = False
+        L += [f"## Changes since {prev.get('release') or 'previous snapshot'}", ""]
+        L += render_changes(snap, prev, forges)
 
-        # Source revisions (one row per team repo whose commit changed)
-        prev_sources = prev.get("sources", {})
-        rows = []
-        for skey, s in sorted(sources.items()):
-            p = prev_sources.get(skey)
-            if p and p.get("revision") != s.get("revision"):
-                rows.append(f"| {pretty(skey)} | {web_url(s['url'])} | `{short_rev(p.get('revision'))}` | "
-                            f"`{short_rev(s.get('revision'))}` | {compare_link(s['url'], p.get('revision'), s.get('revision'))} |")
-        for skey in sorted(sources.keys() - prev_sources.keys()):
-            rows.append(f"| {pretty(skey)} | {web_url(sources[skey]['url'])} | new | "
-                        f"`{short_rev(sources[skey].get('revision'))}` | |")
-        for skey in sorted(prev_sources.keys() - sources.keys()):
-            rows.append(f"| {pretty(skey)} | {web_url(prev_sources[skey].get('url'))} | "
-                        f"`{short_rev(prev_sources[skey].get('revision'))}` | removed | |")
-        if rows:
-            any_change = True
-            L += ["### Source revisions", "", "| Source | URL | From | To | Diff |", "|---|---|---|---|---|", *rows, ""]
+    # Warnings
+    warn = []
+    for k, s in sorted(sources.items()):
+        if s["ready"] != "True":
+            warn.append(f"- {esc(pretty(k))} not ready: {esc(s['message'] or s['ready'])}")
+    for k, o in sorted({**ks, **hrs}.items()):
+        if o["suspended"]:
+            warn.append(f"- {esc(pretty(k))} is suspended")
+        elif o["ready"] != "True":
+            warn.append(f"- {esc(pretty(k))} not ready: {esc(o['message'] or o['ready'])}")
+    for k, o in sorted(ks.items()):
+        src = sources.get(o["source"])
+        if src and src["revision"] and o["applied_revision"] and src["revision"] != o["applied_revision"]:
+            warn.append(f"- {esc(pretty(k))} applied `{esc(o['applied_revision'])}` but its source is at "
+                        f"`{esc(src['revision'])}` (not yet applied, or failing)")
+    for e in images:
+        for w in e["warnings"]:
+            warn.append(f"- {esc(e['namespace'])}/{e['kind']}/{esc(e['name'])} `{esc(e['container'])}`: {esc(w)}")
+    if warn:
+        L += ["## Warnings", "", *warn, ""]
 
-        # Image changes grouped by delivering repo
-        changes = diff_images(prev["images"], entries)
-        if changes:
-            any_change = True
-            L += ["### Image changes", ""]
-            by_source = defaultdict(list)
-            for ch in changes:
-                by_source[(ch[2] or ch[1]).get("source", "")].append(ch)
-            for skey in sorted(by_source, key=lambda s: (s == "", s)):
-                L += [f"#### {source_heading(skey, sources or prev_sources)}", "",
-                      "| Change | Workload | Container | Image | From | To |", "|---|---|---|---|---|---|"]
-                for change, a, b in by_source[skey]:
-                    e = b or a
-                    L.append(f"| {change} | {e['namespace']}/{e['kind']}/{e['name']} | {e['container']} | "
-                             f"`{e['repository']}` | {fmt_version(a)} | {fmt_version(b)} |")
-                L.append("")
+    # Sources
+    L += ["## Flux sources", ""]
+    if git:
+        L += ["### Git repositories", "",
+              "| GitRepository | URL | Ref (spec) | Resolved | Commit | Ready |", "|---|---|---|---|---|---|"]
+        for k, s in sorted(git.items()):
+            L.append(f"| {esc(pretty(k))} | {esc(s['url'])} | {fmt_ref(s['ref'])} | {git_ref_cell(s)} | "
+                     f"{commit_link(s['url'], bare_hash(s['hash']), forges)}<br>`{bare_hash(s['hash']) or '-'}` | "
+                     f"{s['ready']} |")
+        L.append("")
+    if oci:
+        L += ["### OCI repositories", "",
+              "| OCIRepository | URL | Ref (spec) | Resolved | Digest | Ready |", "|---|---|---|---|---|---|"]
+        for k, s in sorted(oci.items()):
+            L.append(f"| {esc(pretty(k))} | {esc(s['url'])} | {fmt_ref(s['ref'])} | {code(s['resolved_ref'])} | "
+                     f"{code(s['hash'])} | {s['ready']} |")
+        L.append("")
+    if buckets:
+        L += ["### Buckets", "", "| Bucket | Location | Revision | Ready |", "|---|---|---|---|"]
+        for k, s in sorted(buckets.items()):
+            L.append(f"| {esc(pretty(k))} | {esc(s['url'])} | {code(s['revision'])} | {s['ready']} |")
+        L.append("")
+    if helmrepos:
+        L += ["### Helm repositories", "", "| HelmRepository | URL | Type | Ready |", "|---|---|---|---|"]
+        for k, s in sorted(helmrepos.items()):
+            L.append(f"| {esc(pretty(k))} | {esc(s['url'])} | {esc(s['type'] or 'default')} | {s['ready']} |")
+        L.append("")
 
-        # Helm chart version changes
-        prev_flux = prev.get("flux", {})
-        chart_rows = [f"| {pretty(k)} | `{v.get('chart', '')}` | `{prev_flux[k].get('chart_version', '')}` | `{v['chart_version']}` |"
-                      for k, v in sorted(flux.items())
-                      if k.startswith("HelmRelease|") and k in prev_flux
-                      and prev_flux[k].get("chart_version") != v.get("chart_version")]
-        if chart_rows:
-            any_change = True
-            L += ["### Helm chart versions", "", "| HelmRelease | Chart | From | To |", "|---|---|---|---|", *chart_rows, ""]
+    # Kustomizations
+    if ks:
+        L += ["## Kustomizations", "",
+              "| Kustomization | Source | Path | Applied revision | Ready |", "|---|---|---|---|---|"]
+        for k, o in sorted(ks.items()):
+            L.append(f"| {esc(pretty(k))} | {esc(pretty(o['source']))} | {code(o['path'])} | "
+                     f"{code(o['applied_revision'])} | {'suspended' if o['suspended'] else o['ready']} |")
+        L.append("")
 
-        if not any_change:
-            L += ["No source, image or chart changes.", ""]
+    # Helm releases
+    if hrs:
+        L += ["## Helm releases", "",
+              "| HelmRelease | Release | Chart | Version | App version | Requested | Chart source | Chart digest | Ready |",
+              "|---|---|---|---|---|---|---|---|---|"]
+        for k, h in sorted(hrs.items()):
+            L.append(f"| {esc(pretty(k))} | {code(h['target_namespace'] + '/' + h['release_name'])} | "
+                     f"{code(h['chart'])} | {code(h['chart_version'])} | {code(h['app_version'])} | "
+                     f"{requested_cell(h, sources)} | {chart_source_cell(h, sources)} | "
+                     f"{code(h['chart_digest'])} | {'suspended' if h['suspended'] else h['ready']} |")
+        L.append("")
 
-    # Full inventory: source repo -> Flux object -> containers
-    L += ["## Deployed components", ""]
+    # Images by delivering repo -> Flux owner
+    L += ["## Images", ""]
     by_source = defaultdict(lambda: defaultdict(list))
-    for e in entries:
+    for e in images:
         by_source[e["source"]][e["owner"]].append(e)
-
     for skey in sorted(by_source, key=lambda s: (s == "", s)):
-        L.append(f"### {source_heading(skey, sources)}")
+        L.append(f"### {esc(source_heading(skey, sources))}")
         s = sources.get(skey)
         if s:
-            L.append(f"Revision `{short_rev(s['revision'])}`" + (f" ({s['ref']})" if s["ref"] else "")
-                     + f", Ready: {s['ready']}")
+            L.append(f"Ref {fmt_ref(s['ref'])}, resolved {git_ref_cell(s) if s['kind'] == 'GitRepository' else code(s['resolved_ref'])}, "
+                     f"{'commit' if s['kind'] == 'GitRepository' else 'revision'} `{bare_hash(s['hash']) or s['revision'] or '-'}`")
         L.append("")
         for owner, items in sorted(by_source[skey].items()):
-            obj = flux.get(owner, {})
-            L.append(f"#### {pretty(owner) or 'No Flux owner'}")
-            if owner.startswith("HelmRelease|") and obj:
-                L.append(f"Chart `{obj['chart']}` `{obj['chart_version']}`"
-                         + (f", app `{obj['app_version']}`" if obj.get("app_version") else "")
-                         + f" from {pretty(obj['source'])}, Ready: {obj['ready']}  ")
-            elif obj:
-                L.append(f"Path `{obj['path'] or '.'}`, Ready: {obj['ready']}  ")
-            chain = items[0]["chain"]
-            if len(chain) > 1:
-                L.append("Applied via: " + " → ".join(pretty(c) for c in chain))
-            L += ["", "| Workload | Container | Image | Version |", "|---|---|---|---|"]
+            L.append(f"#### {esc(pretty(owner)) or 'No Flux owner'}")
+            if owner in hrs:
+                h = hrs[owner]
+                L.append(f"Chart {code(h['chart'])} {code(h['chart_version'])} (app {code(h['app_version'])})  ")
+            elif owner in ks:
+                L.append(f"Path {code(ks[owner]['path'])}, applied {code(ks[owner]['applied_revision'])}  ")
+            if len(items[0]["chain"]) > 1:
+                L.append("Applied via: " + " → ".join(esc(pretty(c)) for c in items[0]["chain"]))
+            L += ["", "| Workload | Container | Image | Digest from | Pods |", "|---|---|---|---|---|"]
             for e in items:
-                warn = " ⚠️ multiple digests running" if e["digest_mismatch"] else ""
-                L.append(f"| {e['namespace']}/{e['kind']}/{e['name']} | {e['container']}"
-                         f"{' (init)' if e['init'] else ''} | `{e['repository']}` | {fmt_version(e)}{warn} |")
+                wl = f"{esc(e['namespace'])}/{e['kind']}/{esc(e['name'])}"
+                if e["controlled_by"]:
+                    wl += f"<br>(managed by {esc(e['controlled_by'])})"
+                ctr = esc(e["container"]) + ("" if e["container_type"] == "container" else f" ({e['container_type']})")
+                L.append(f"| {wl} | {ctr} | {code(e['image'])} | {e['digest_source'] or '⚠️ unknown'} | {e['pods']} |")
             L.append("")
+
+    L += ["## All images", "", "```"] + sorted({e["image"] for e in images}) + ["```", ""]
     return "\n".join(L)
 
 
@@ -431,43 +862,73 @@ def render_markdown(snap, prev=None, title=None):
 # Main
 # --------------------------------------------------------------------------- #
 def main():
-    p = argparse.ArgumentParser(description="Generate release notes from images in a Flux-managed cluster.")
+    p = argparse.ArgumentParser(description="Generate release notes from a Flux-managed cluster.")
     p.add_argument("--context", help="kubectl context to use")
     p.add_argument("--kubeconfig", help="path to kubeconfig")
     p.add_argument("-n", "--namespace", help="limit workloads to one namespace (default: all)")
     p.add_argument("--exclude-namespace", action="append", default=None,
                    help=f"namespace to skip; repeatable (default: {', '.join(DEFAULT_EXCLUDED_NAMESPACES)})")
     p.add_argument("--include-unmanaged", action="store_true",
-                   help="also list workloads that have no Flux labels")
+                   help="also list workloads that no Flux object applied")
+    p.add_argument("--flux-namespace", default="flux-system", help="namespace Flux is installed in")
+    p.add_argument("--resolve-digests", choices=["off", "auto", "crane", "skopeo"], default="off",
+                   help="look up digests in the registry for images no pod reports one for")
+    p.add_argument("--forge", action="append", default=[], metavar="HOST=TYPE",
+                   help="treat a self-hosted Git host as github, gitlab or bitbucket for links; repeatable")
+    p.add_argument("--release", default="", help="name of this release (stored in the snapshot)")
     p.add_argument("--previous", help="previous snapshot JSON to diff against")
-    p.add_argument("--snapshot-out", help="write the current snapshot JSON here")
+    p.add_argument("--snapshot-out", help="write this run's snapshot JSON here")
+    p.add_argument("--images-out", help="write the unique full image references, one per line, here")
     p.add_argument("--out", help="write Markdown here (default: stdout)")
     p.add_argument("--title", help="heading for the release notes")
     args = p.parse_args()
 
-    kubectl = Kubectl(args.context, args.kubeconfig)
-    excluded = set(args.exclude_namespace if args.exclude_namespace is not None
-                   else DEFAULT_EXCLUDED_NAMESPACES)
-
-    flux = collect_flux_objects(kubectl)
-    snapshot = {
-        "context": args.context or kubectl.current_context(),
-        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "sources": collect_sources(kubectl),
-        "flux": flux,
-        "images": collect_images(kubectl, flux, args.namespace, excluded, args.include_unmanaged),
-    }
+    forges = {}
+    for f in args.forge:
+        host, _, kind = f.partition("=")
+        if kind not in ("github", "gitlab", "bitbucket"):
+            sys.exit(f"--forge {f}: TYPE must be github, gitlab or bitbucket")
+        forges[host] = kind
 
     previous = None
     if args.previous:
         with open(args.previous) as fh:
             previous = json.load(fh)
+        if previous.get("schema") != SCHEMA:
+            print(f"warning: {args.previous} uses an older snapshot format; skipping the diff", file=sys.stderr)
+            previous = None
+
+    kubectl = Kubectl(args.context, args.kubeconfig)
+    excluded = set(args.exclude_namespace if args.exclude_namespace is not None
+                   else DEFAULT_EXCLUDED_NAMESPACES)
+    resolver = DigestResolver(args.resolve_digests) if args.resolve_digests != "off" else None
+
+    flux_ns = kubectl.get_one("namespace", None, args.flux_namespace) or {}
+    kustomizations = collect_kustomizations(kubectl)
+    helmreleases = collect_helmreleases(kubectl)
+    snapshot = {
+        "schema": SCHEMA,
+        "release": args.release,
+        "previous_release": (previous or {}).get("release", ""),
+        "context": args.context or kubectl.current_context(),
+        "kubernetes_version": kubectl.server_version(),
+        "flux_version": (flux_ns.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/version", "unknown"),
+        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "sources": collect_sources(kubectl),
+        "kustomizations": kustomizations,
+        "helmreleases": helmreleases,
+        "images": collect_images(kubectl, {**kustomizations, **helmreleases}, args.namespace, excluded,
+                                 args.include_unmanaged, resolver),
+    }
 
     if args.snapshot_out:
         with open(args.snapshot_out, "w") as fh:
-            json.dump(snapshot, fh, indent=2)
+            json.dump(snapshot, fh, indent=2, sort_keys=True)
+    if args.images_out:
+        with open(args.images_out, "w") as fh:
+            fh.write("\n".join(sorted({e["image"] for e in snapshot["images"]})) + "\n")
 
-    md = render_markdown(snapshot, previous, args.title)
+    md = render_markdown(snapshot, previous, args.title, forges)
     if args.out:
         with open(args.out, "w") as fh:
             fh.write(md + "\n")
