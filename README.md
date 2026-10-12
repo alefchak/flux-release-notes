@@ -13,7 +13,7 @@ By default the notes are a short summary:
 
 - **What changed:** for each repo, its version change with a compare link, followed by the charts and images that changed with it.
 - **Needs attention:** one line per problem, such as a failing Kustomization, a re-pushed tag or a missing digest.
-- **Deployed:** compact tables of the repos, Helm charts and images now running, with short digests. Full image references are in a collapsible block.
+- **Deployed:** compact tables of the repos, Helm charts and images now running, with short digests. A final table lists each image's full name, tag and digest.
 
 `--format full`, or `--full-out FILE` alongside the summary, writes the detailed
 report: every source, Kustomization, HelmRelease and container, with delivery

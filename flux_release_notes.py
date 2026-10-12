@@ -905,8 +905,11 @@ def render_summary(snap, prev=None, title=None, forges=None):
             L.append(f"| {esc(image_label(e))} | {code(e['tag'])} | "
                      f"{code(e['digest'][7:19]) if e['digest'] else '⚠️ unknown'} | {esc(who)} |")
         L.append("")
-        L += ["<details><summary>Full image references</summary>", "", "```"]
-        L += sorted(by_ref) + ["```", "", "</details>", ""]
+        L += ["### Full image references", "", "| Image | Tag | Digest |", "|---|---|---|"]
+        for ref, e in sorted(by_ref.items()):
+            L.append(f"| {code(e['registry'] + '/' + e['repository'])} | {code(e['tag'])} | "
+                     f"{code(e['digest']) if e['digest'] else '⚠️ unknown'} |")
+        L.append("")
     return "\n".join(L)
 
 
