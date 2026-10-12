@@ -9,15 +9,17 @@ works however each team lays out its repository.
 
 ## Output
 
-By default the notes are a short summary:
+There are three formats. Choose one for `--out` with `--format`, or write the
+others alongside it with `--inventory-out` and `--detailed-out`.
 
-- **What changed:** for each repo, its version change with a compare link, followed by the charts and images that changed with it.
-- **Needs attention:** one line per problem, such as a failing Kustomization, a re-pushed tag or a missing digest.
-- **Deployed:** compact tables of the repos, Helm charts and images now running, with each image's full name, tag, full digest and the workloads using it.
+| Format | Contents |
+|---|---|
+| `summary` (default) | **What changed:** each repo's version change with a compare link, followed by the charts and images that changed with it. **Needs attention:** one line per problem, such as a failing Kustomization, a re-pushed tag or a missing digest. **Deployed:** tables of the repos, Helm charts and images now running |
+| `inventory` | Only the Deployed tables: what is running right now, with no comparison and no warnings |
+| `detailed` | Every source, Kustomization, HelmRelease and container, with delivery paths |
 
-`--format full`, or `--full-out FILE` alongside the summary, writes the detailed
-report: every source, Kustomization, HelmRelease and container, with delivery
-paths. The snapshot JSON always holds everything listed below.
+The image table gives each image's full name, tag, full digest and the
+workloads using it. The snapshot JSON always holds everything listed below.
 
 ## What gets recorded
 
@@ -99,8 +101,8 @@ With `--previous`, the notes start with a **Changes since …** section. It list
 | `--images-out` | Plain list of unique full image references, e.g. for scanners |
 | `--out` | Markdown output file (default: stdout) |
 | `--title` | Heading for the notes |
-| `--format summary\|full` | Summary (default) or the detailed report for `--out` |
-| `--full-out` | Also write the detailed report to this file |
+| `--format summary\|inventory\|detailed` | Format for `--out` (default `summary`) |
+| `--inventory-out`, `--detailed-out` | Also write the inventory or detailed report to these files |
 
 ### About digests
 
@@ -117,7 +119,7 @@ don't need to create any tokens.
 
 | Pipeline | What happens |
 |---|---|
-| Tag (e.g. `v2026.10.2`) | Notes diffed against the last release, a GitLab Release is created with the summary, and the baseline snapshot is updated. The full report is kept as a job artifact |
+| Tag (e.g. `v2026.10.2`) | Notes diffed against the last release, a GitLab Release is created with the summary, and the baseline snapshot is updated. `INVENTORY.md` and `RELEASE_NOTES_DETAILED.md` are kept as job artifacts |
 | Schedule or manual run | Preview notes against the last release, saved as job artifacts; baseline unchanged (set `UPDATE_BASELINE=true` to override) |
 
 Retrying a tag pipeline still diffs against the release before it.

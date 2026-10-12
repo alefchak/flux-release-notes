@@ -793,12 +793,7 @@ def render_summary(snap, prev=None, title=None, forges=None):
     forges = forges or {}
     sources, ks, hrs, images = snap["sources"], snap["kustomizations"], snap["helmreleases"], snap["images"]
     lookup = {**ks, **hrs}
-    heading = title or (f"Release {snap['release']}" if snap.get("release") else "Release notes")
-    meta = [f"`{snap['context']}`", f"Kubernetes {snap['kubernetes_version']}", f"Flux {snap['flux_version']}",
-            snap["generated_at"][:16] + " UTC"]
-    if prev:
-        meta.append(f"compared with {prev.get('release') or prev['generated_at'][:16]}")
-    L = [f"# {esc(heading)}", "", " · ".join(meta), ""]
+    L = render_header(snap, prev, title, "Release notes")
 
     # ---- What changed, grouped by the repo that delivers it ----
     if prev:
@@ -882,11 +877,31 @@ def render_summary(snap, prev=None, title=None, forges=None):
             L.append(f"- …and {len(warn) - 10} more (see the full report)")
         L.append("")
 
-    # ---- What's deployed ----
-    L += ["## Deployed", ""]
+    L += ["## Deployed", ""] + render_deployed(snap, forges, "###")
+    return "\n".join(L)
+
+
+def render_header(snap, prev, title, default_heading):
+    heading = title or (f"Release {snap['release']}" if snap.get("release") else default_heading)
+    meta = [f"`{snap['context']}`", f"Kubernetes {snap['kubernetes_version']}", f"Flux {snap['flux_version']}",
+            snap["generated_at"][:16] + " UTC"]
+    if prev:
+        meta.append(f"compared with {prev.get('release') or prev['generated_at'][:16]}")
+    return [f"# {esc(heading)}", "", " · ".join(meta), ""]
+
+
+def render_inventory(snap, prev=None, title=None, forges=None):
+    """What is deployed right now: repos, Helm charts and images. No comparison."""
+    return "\n".join(render_header(snap, None, title, "Deployed versions")
+                     + render_deployed(snap, forges or {}, "##"))
+
+
+def render_deployed(snap, forges, level):
+    sources, hrs, images = snap["sources"], snap["helmreleases"], snap["images"]
+    L = []
     repos = {k: s for k, s in sources.items() if s["kind"] in ("GitRepository", "OCIRepository", "Bucket")}
     if repos:
-        L += ["| Repository | Version | Commit / digest |", "|---|---|---|"]
+        L += [f"{level} Repositories", "", "| Repository | Version | Commit / digest |", "|---|---|---|"]
         for k, s in sorted(repos.items(), key=lambda kv: repo_label(kv[0], sources)):
             ref, h = parse_revision(s["revision"])
             ref = re.sub(r"^refs/(tags|heads)/", "", ref)
@@ -895,7 +910,7 @@ def render_summary(snap, prev=None, title=None, forges=None):
             L.append(f"| {esc(repo_label(k, sources))} | {code(ref)} | {hcell} |")
         L.append("")
     if hrs:
-        L += ["| Helm chart | Release | Version |", "|---|---|---|"]
+        L += [f"{level} Helm charts", "", "| Helm chart | Release | Version |", "|---|---|---|"]
         for k, h in sorted(hrs.items(), key=lambda kv: (kv[1]["chart"], kv[0])):
             L.append(f"| {code(h['chart'])} | {esc(h['target_namespace'] + '/' + h['release_name'])} | "
                      f"{code(h['chart_version'])} |")
@@ -906,14 +921,14 @@ def render_summary(snap, prev=None, title=None, forges=None):
         for e in images:
             used[e["image"]].add(e["name"])
             by_ref[e["image"]] = e
-        L += ["| Image | Tag | Digest | Used by |", "|---|---|---|---|"]
+        L += [f"{level} Images", "", "| Image | Tag | Digest | Used by |", "|---|---|---|---|"]
         for ref, e in sorted(by_ref.items(), key=lambda kv: (kv[1]["registry"] + "/" + kv[1]["repository"], kv[0])):
             names = sorted(used[ref])
             who = ", ".join(names[:3]) + (f" +{len(names) - 3}" if len(names) > 3 else "")
             L.append(f"| {code(e['registry'] + '/' + e['repository'])} | {code(e['tag'])} | "
                      f"{code(e['digest']) if e['digest'] else '⚠️ unknown'} | {esc(who)} |")
         L.append("")
-    return "\n".join(L)
+    return L
 
 
 def render_markdown(snap, prev=None, title=None, forges=None):
@@ -1029,6 +1044,9 @@ def render_markdown(snap, prev=None, title=None, forges=None):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+FORMATS = {"summary": render_summary, "inventory": render_inventory, "detailed": render_markdown}
+
+
 def main():
     p = argparse.ArgumentParser(description="Generate release notes from a Flux-managed cluster.")
     p.add_argument("--context", help="kubectl context to use")
@@ -1049,10 +1067,12 @@ def main():
     p.add_argument("--images-out", help="write the unique full image references, one per line, here")
     p.add_argument("--out", help="write Markdown here (default: stdout)")
     p.add_argument("--title", help="heading for the release notes")
-    p.add_argument("--format", choices=["summary", "full"], default="summary",
+    p.add_argument("--format", choices=list(FORMATS), default="summary",
                    help="summary (default): what changed, what needs attention, what is deployed; "
-                        "full: every source, Kustomization, HelmRelease and container in detail")
-    p.add_argument("--full-out", help="also write the full report here")
+                        "inventory: only what is deployed now, no comparison; "
+                        "detailed: every source, Kustomization, HelmRelease and container")
+    p.add_argument("--inventory-out", help="also write the inventory here")
+    p.add_argument("--detailed-out", help="also write the detailed report here")
     args = p.parse_args()
 
     forges = {}
@@ -1100,11 +1120,11 @@ def main():
         with open(args.images_out, "w") as fh:
             fh.write("\n".join(sorted({e["image"] for e in snapshot["images"]})) + "\n")
 
-    if args.full_out:
-        with open(args.full_out, "w") as fh:
-            fh.write(render_markdown(snapshot, previous, args.title, forges) + "\n")
-    render = render_summary if args.format == "summary" else render_markdown
-    md = render(snapshot, previous, args.title, forges)
+    for fmt, path in (("inventory", args.inventory_out), ("detailed", args.detailed_out)):
+        if path:
+            with open(path, "w") as fh:
+                fh.write(FORMATS[fmt](snapshot, previous, args.title, forges) + "\n")
+    md = FORMATS[args.format](snapshot, previous, args.title, forges)
     if args.out:
         with open(args.out, "w") as fh:
             fh.write(md + "\n")

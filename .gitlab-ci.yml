@@ -14,7 +14,8 @@
 # What each pipeline does:
 #   * Tag pipeline (e.g. v2026.10.2): notes diffed against the last release, a
 #     GitLab Release is created from the summary, and the baseline snapshot is updated.
-#     The full report (RELEASE_NOTES_FULL.md) is kept as a job artifact.
+#     INVENTORY.md (what is deployed, no comparison) and RELEASE_NOTES_DETAILED.md
+#     are kept as job artifacts.
 #   * Scheduled or manual ("Run pipeline") pipeline: preview notes against the
 #     last release, published as job artifacts. The baseline is left alone, unless
 #     you set UPDATE_BASELINE=true for that run.
@@ -97,7 +98,7 @@ release-notes:
 
       python3 flux_release_notes.py $ARGS --release "$RELEASE" --title "$TITLE" \
         --snapshot-out snapshot.json --images-out images.txt \
-        --out RELEASE_NOTES.md --full-out RELEASE_NOTES_FULL.md
+        --out RELEASE_NOTES.md --inventory-out INVENTORY.md --detailed-out RELEASE_NOTES_DETAILED.md
 
       if [ -n "$RELEASE" ]; then
         curl -fsS --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file snapshot.json "$PACKAGE_URL/$RELEASE/snapshot.json"
@@ -108,7 +109,8 @@ release-notes:
     name: "release-notes-${CI_COMMIT_REF_SLUG}"
     paths:
       - RELEASE_NOTES.md
-      - RELEASE_NOTES_FULL.md
+      - INVENTORY.md
+      - RELEASE_NOTES_DETAILED.md
       - snapshot.json
       - images.txt
     expire_in: 90 days
