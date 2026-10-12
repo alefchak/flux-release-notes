@@ -21,7 +21,12 @@
 #
 # Requirements: kubectl, jq, curl, and sha256sum or shasum.
 
-set -euo pipefail
+set -Eeuo pipefail
+# Never exit silently: report the line and command of any unexpected failure.
+on_error() {
+  echo "error: line $2: \"$3\" failed (exit $1). Re-run with --debug for a full trace." >&2
+}
+trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 
 usage() {
   cat <<'EOF'
@@ -39,6 +44,7 @@ Usage: download_flux_artifacts.sh [options]
       --reconcile         ask Flux to reconcile sources that are not Ready, and wait
                           for them before downloading (needs patch on the sources)
       --timeout SECONDS   how long to wait for each reconcile round (default: 180)
+      --debug             print every command as it runs
   -h, --help              show this help
 EOF
 }
@@ -65,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --base-url)       BASE_URL="${2%/}"; shift 2 ;;
     --reconcile)      RECONCILE=true; shift ;;
     --timeout)        TIMEOUT="$2"; shift 2 ;;
+    --debug)          set -x; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -126,7 +133,9 @@ reconcile_and_wait() {
     for obj in "${pending[@]}"; do
       handled="$("${KUBECTL[@]}" -n "${obj%%/*}" get "$resource" "${obj#*/}" \
         -o jsonpath='{.status.lastHandledReconcileAt}' 2>/dev/null || true)"
-      [[ "$handled" == "$token" ]] || still+=("$obj")
+      if [[ "$handled" != "$token" ]]; then
+        still+=("$obj")
+      fi
     done
     pending=(${still[@]+"${still[@]}"})
   done
@@ -145,7 +154,9 @@ reconcile_not_ready() {
       | \"warn  $kind \\(.metadata.namespace)/\\(.metadata.name): suspended, not reconciling\"" "$list" >&2
   while read -r obj; do objs+=("$obj"); done < <(jq -r "$not_ready
       | \"\\(.metadata.namespace)/\\(.metadata.name)\"" "$list")
-  [[ ${#objs[@]} -eq 0 ]] && return 0
+  if [[ ${#objs[@]} -eq 0 ]]; then
+    return 0
+  fi
 
   if [[ "$kind" == helmchart ]]; then
     # Reconcile the repositories the charts come from first, one batch per kind.
@@ -165,20 +176,30 @@ reconcile_not_ready() {
 
 # --- Connect to source-controller -------------------------------------------
 if [[ -z "$BASE_URL" ]]; then
+  echo "Connecting to source-controller (port-forward to svc/source-controller in $FLUX_NS on port $PORT)..."
   "${KUBECTL[@]}" -n "$FLUX_NS" port-forward svc/source-controller "$PORT:80" >"$TMP/port-forward.log" 2>&1 &
   PF_PID=$!
   BASE_URL="http://127.0.0.1:$PORT"
-  for _ in $(seq 1 40); do
+  code="000"
+  for _ in $(seq 1 60); do
     if ! kill -0 "$PF_PID" 2>/dev/null; then
       echo "error: port-forward to svc/source-controller in $FLUX_NS failed:" >&2
       cat "$TMP/port-forward.log" >&2
       exit 1
     fi
-    code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/" || true)"
-    [[ "$code" != "000" ]] && break
+    code="$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "$BASE_URL/" || true)"
+    if [[ "$code" != "000" ]]; then
+      break
+    fi
     sleep 0.25
   done
-  [[ "$code" == "000" ]] && { echo "error: source-controller did not answer on $BASE_URL" >&2; exit 1; }
+  if [[ "$code" == "000" ]]; then
+    echo "error: source-controller did not answer on $BASE_URL within 15s:" >&2
+    cat "$TMP/port-forward.log" >&2
+    exit 1
+  fi
+else
+  echo "Using source-controller at $BASE_URL"
 fi
 
 # --- Download ----------------------------------------------------------------
@@ -200,6 +221,11 @@ for kind in "${kinds[@]}"; do
 
   if ! "${KUBECTL[@]}" get "$resource" "${NS_ARGS[@]}" -o json >"$TMP/list.json" 2>"$TMP/err"; then
     echo "warning: cannot list $resource: $(tail -1 "$TMP/err")" >&2
+    continue
+  fi
+  total="$(jq '.items | length' "$TMP/list.json")"
+  echo "Found $total ${resource%%.*}${NAMESPACE:+ in $NAMESPACE}"
+  if [[ "$total" -eq 0 ]]; then
     continue
   fi
   if $RECONCILE; then
@@ -239,7 +265,8 @@ for kind in "${kinds[@]}"; do
     dest="$OUT/$dir/$ns/$name/$file"
     mkdir -p "$(dirname "$dest")"
 
-    if ! curl -fsS --retry 3 --retry-delay 1 -o "$dest.part" "$BASE_URL$path" 2>"$TMP/err"; then
+    if ! curl -fsS --connect-timeout 10 --max-time 900 --retry 3 --retry-delay 1 \
+        -o "$dest.part" "$BASE_URL$path" 2>"$TMP/err"; then
       echo "FAIL  $label: download failed: $(tail -1 "$TMP/err")" >&2
       rm -f "$dest.part"; failed=$((failed + 1)); continue
     fi
@@ -268,4 +295,6 @@ done
 
 echo
 echo "Downloaded $ok artifact(s) to $OUT ($skipped skipped, $failed failed). Manifest: $MANIFEST"
-[[ "$failed" -eq 0 ]]
+if [[ "$failed" -gt 0 ]]; then
+  exit 1
+fi

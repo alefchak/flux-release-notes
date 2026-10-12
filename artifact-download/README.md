@@ -46,6 +46,7 @@ and warns about any request that wasn't handled in time.
 | `--flux-namespace` | Where source-controller runs (default `flux-system`) |
 | `--port` | Local port for the port-forward (default `9797`) |
 | `--base-url` | Reach source-controller directly instead of port-forwarding |
+| `--debug` | Print every command as it runs, for troubleshooting |
 
 ## Requirements
 
